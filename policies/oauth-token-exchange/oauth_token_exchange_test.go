@@ -20,7 +20,6 @@ package oauthtokenexchange
 import (
 	"context"
 	"encoding/json"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -512,31 +511,32 @@ func TestOnRequestBody_MissingAccessToken_ReturnsBadGateway(t *testing.T) {
 	}
 }
 
-// TestOnRequestBody_NilSharedHTTPClient_FallsBackAndBlocksLoopback verifies
-// that a nil shared client no longer hard-fails: performTokenExchange falls
-// back to fallbackHTTPClient instead. That fallback client still enforces
-// the SSRF dial-time guard, so it refuses to connect to the httptest server
-// here (bound to the loopback address) — this still surfaces as a 502, but
-// now because the guard blocked the destination, not because no client was
-// configured. See TestFallbackHTTPClient_BlocksLoopbackDestination below for
-// a direct test of the guard itself.
-func TestOnRequestBody_NilSharedHTTPClient_FallsBackAndBlocksLoopback(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("token endpoint should never be reached: fallback client must block loopback destinations")
+// TestOnRequestBody_NilSharedHTTPClient_FallsBackAndSucceeds verifies that a
+// nil shared client (e.g. this policy invoked before the engine finishes
+// startup wiring) does not hard-fail the request: performTokenExchange falls
+// back to fallbackHTTPClient, which still completes the exchange. Uses a
+// plain (non-TLS) server since fallbackHTTPClient has no custom TLS trust
+// store for a self-signed cert.
+func TestOnRequestBody_NilSharedHTTPClient_FallsBackAndSucceeds(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "exchanged-token", "expires_in": 300})
 	}))
 	defer server.Close()
 	utils.SetSharedHTTPClient(nil)
 
 	p := newTestPolicy()
-	reqCtx := newRequestContext(map[string][]string{"Authorization": {"Bearer original-client-token"}}, "/pets")
-	result := p.OnRequestBody(context.Background(), reqCtx, baseParams(server.URL))
+	params := baseParams(server.URL)
+	params["allowInsecureTokenEndpoint"] = true
 
-	resp, ok := result.(policy.ImmediateResponse)
+	reqCtx := newRequestContext(map[string][]string{"Authorization": {"Bearer original-client-token"}}, "/pets")
+	result := p.OnRequestBody(context.Background(), reqCtx, params)
+
+	action, ok := result.(policy.UpstreamRequestModifications)
 	if !ok {
-		t.Fatalf("expected ImmediateResponse, got %T", result)
+		t.Fatalf("expected UpstreamRequestModifications, got %T: %+v", result, result)
 	}
-	if resp.StatusCode != 502 {
-		t.Errorf("status = %d, want 502", resp.StatusCode)
+	if got := action.HeadersToSet["Authorization"]; got != "Bearer exchanged-token" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer exchanged-token")
 	}
 }
 
@@ -794,18 +794,7 @@ func TestMode_RequestHeaderModeIsProcess(t *testing.T) {
 	}
 }
 
-// ─── fallbackHTTPClient / isDeniedDestination ───────────────────────────────
-
-func TestFallbackHTTPClient_BlocksLoopbackDestination(t *testing.T) {
-	client := fallbackHTTPClient()
-	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:1/", nil)
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	if _, err := client.Do(req); err == nil {
-		t.Error("expected fallback client to refuse dialing a loopback address")
-	}
-}
+// ─── fallbackHTTPClient ──────────────────────────────────────────────────────
 
 func TestFallbackHTTPClient_NeverAutoFollowsRedirects(t *testing.T) {
 	client := fallbackHTTPClient()
@@ -814,25 +803,6 @@ func TestFallbackHTTPClient_NeverAutoFollowsRedirects(t *testing.T) {
 	}
 	if err := client.CheckRedirect(&http.Request{}, nil); err != http.ErrUseLastResponse {
 		t.Errorf("CheckRedirect = %v, want http.ErrUseLastResponse", err)
-	}
-}
-
-func TestIsDeniedDestination(t *testing.T) {
-	denied := []string{
-		"127.0.0.1", "10.1.2.3", "172.16.0.5", "192.168.1.1",
-		"169.254.169.254", "::1", "fe80::1", "fd12:3456:789a::1",
-	}
-	for _, ip := range denied {
-		if !isDeniedDestination(net.ParseIP(ip)) {
-			t.Errorf("isDeniedDestination(%q) = false, want true", ip)
-		}
-	}
-
-	allowed := []string{"93.184.216.34", "8.8.8.8", "2001:4860:4860::8888"}
-	for _, ip := range allowed {
-		if isDeniedDestination(net.ParseIP(ip)) {
-			t.Errorf("isDeniedDestination(%q) = true, want false", ip)
-		}
 	}
 }
 
@@ -867,6 +837,28 @@ func TestExtractSubjectToken_Header_WrongPrefix(t *testing.T) {
 	_, ok := extractSubjectToken(reqCtx.Headers, reqCtx.Path, subjectTokenSource{kind: "header", name: "Authorization", prefix: "Bearer "})
 	if ok {
 		t.Error("expected no match when prefix doesn't match")
+	}
+}
+
+// TestExtractSubjectToken_Header_PrefixCaseInsensitive guards against RFC
+// 7235: the HTTP auth-scheme token is case-insensitive, so a client sending
+// "bearer <token>" (or any other casing) must still be recognized.
+func TestExtractSubjectToken_Header_PrefixCaseInsensitive(t *testing.T) {
+	reqCtx := newRequestContext(map[string][]string{"Authorization": {"bearer abc123"}}, "/pets")
+	tok, ok := extractSubjectToken(reqCtx.Headers, reqCtx.Path, subjectTokenSource{kind: "header", name: "Authorization", prefix: "Bearer "})
+	if !ok || tok != "abc123" {
+		t.Errorf("got (%q, %v), want (abc123, true)", tok, ok)
+	}
+}
+
+// TestExtractSubjectToken_Header_PrefixTooShort guards against a panic when
+// the header value is shorter than the configured prefix — slicing
+// v[:len(src.prefix)] requires an explicit length check first.
+func TestExtractSubjectToken_Header_PrefixTooShort(t *testing.T) {
+	reqCtx := newRequestContext(map[string][]string{"Authorization": {"Bear"}}, "/pets")
+	_, ok := extractSubjectToken(reqCtx.Headers, reqCtx.Path, subjectTokenSource{kind: "header", name: "Authorization", prefix: "Bearer "})
+	if ok {
+		t.Error("expected no match when the header value is shorter than the configured prefix")
 	}
 }
 

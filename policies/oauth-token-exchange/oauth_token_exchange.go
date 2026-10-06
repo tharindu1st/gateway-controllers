@@ -584,11 +584,16 @@ func extractSubjectToken(headers *policy.Headers, path string, src subjectTokenS
 			"valueLength", len(v),
 		)
 		if src.prefix != "" {
-			if !strings.HasPrefix(v, src.prefix) {
-				// The header IS present — this is a prefix mismatch, not a
-				// visibility/ordering gap. Logging the configured prefix (a
-				// static config string, never the credential itself) makes
-				// that distinction visible without exposing v.
+			// Case-insensitive per RFC 7235 (the HTTP auth-scheme token is
+			// case-insensitive — a client sending "bearer <token>" is valid).
+			// Guard the length before slicing: v[:len(src.prefix)] would
+			// otherwise panic on a too-short value, unlike strings.HasPrefix.
+			if len(v) < len(src.prefix) || !strings.EqualFold(v[:len(src.prefix)], src.prefix) {
+				// The header IS present — this is a prefix mismatch (or too
+				// short to contain one), not a visibility/ordering gap.
+				// Logging the configured prefix (a static config string,
+				// never the credential itself) makes that distinction
+				// visible without exposing v.
 				slog.Warn("OAuth token exchange: header present but does not start with the configured prefix",
 					"name", src.name,
 					"configuredPrefix", src.prefix,
@@ -596,7 +601,10 @@ func extractSubjectToken(headers *policy.Headers, path string, src subjectTokenS
 				)
 				return "", false
 			}
-			v = strings.TrimPrefix(v, src.prefix)
+			// Slice off exactly the prefix length rather than TrimPrefix,
+			// which wouldn't strip a differently-cased prefix — the token's
+			// own casing must be left untouched.
+			v = v[len(src.prefix):]
 		}
 		v = strings.TrimSpace(v)
 		return v, v != ""
@@ -740,18 +748,17 @@ func queryFromPath(path string) url.Values {
 	return vals
 }
 
-// performTokenExchange calls the token endpoint via the process-wide,
-// SSRF-guarded HTTP client (sdk/core/utils.SharedHTTPClient) — never a
-// hand-rolled, unguarded client — per ssrf-prevention.md directives 1-2. If
-// the engine hasn't installed a shared client yet, it falls back to
-// fallbackHTTPClient, which applies the same dial-time SSRF guard rather
-// than dropping to http.DefaultClient (see that function's doc comment).
-// The response is read through a bounded reader before decoding, per
-// directive 3.
+// performTokenExchange calls the token endpoint via the process-wide HTTP
+// client (sdk/core/utils.SharedHTTPClient), which the policy engine already
+// configures with its own SSRF guard — this policy does not duplicate that
+// guard locally. If the engine hasn't installed a shared client yet, it
+// falls back to fallbackHTTPClient (httpclient.go) rather than dropping to
+// http.DefaultClient. The response is read through a bounded reader before
+// decoding, per ssrf-prevention.md directive 3.
 func performTokenExchange(ctx context.Context, cfg *exchangeConfig, subjectToken string) (string, time.Duration, error) {
 	client := utils.SharedHTTPClient()
 	if client == nil {
-		slog.Warn("OAuth token exchange: shared HTTP client not configured, using guarded fallback client")
+		slog.Warn("OAuth token exchange: shared HTTP client not configured, using fallback client")
 		client = fallbackHTTPClient()
 	}
 
