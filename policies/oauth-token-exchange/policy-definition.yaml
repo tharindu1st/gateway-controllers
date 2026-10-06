@@ -85,6 +85,7 @@ parameters:
         type: header
         name: Authorization
         prefix: "Bearer "
+        forwardToken: false
       properties:
         type:
           type: string
@@ -102,6 +103,20 @@ parameters:
             Only used when type is "header". Stripped from the header value
             before it is used as the subject token (default "Bearer "). Set
             to "" for a header with no prefix.
+        forwardToken:
+          type: boolean
+          description: >-
+            If false (the default), the credential is stripped from the
+            request (the header, cookie, or query parameter it was read from)
+            before forwarding upstream, once it has been read. Set to true to
+            also leave the original credential on the request. Same name as
+            the forwardToken parameter in jwt-auth / opaque-token-auth, but
+            the default is inverted: those policies forward the caller's own
+            token upstream by default since it IS the upstream credential,
+            whereas here the upstream credential is the exchanged token
+            already set on `header`, so the original subject credential
+            defaults to being stripped.
+          default: false
 
     subjectTokenType:
       type: string

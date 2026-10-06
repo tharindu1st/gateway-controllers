@@ -270,6 +270,163 @@ func TestOnRequestBody_ClientSecretPost(t *testing.T) {
 	}
 }
 
+// ─── OnRequestBody: subjectTokenSource.forwardToken / removal ──────────────
+
+// newSuccessServer returns an httptest server that always exchanges
+// successfully, and wires it in as the shared HTTP client. Callers must
+// `defer server.Close()` and `defer utils.SetSharedHTTPClient(nil)`.
+func newSuccessServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "exchanged-token", "expires_in": 300})
+	}))
+	utils.SetSharedHTTPClient(server.Client())
+	return server
+}
+
+func TestOnRequestBody_RemovesMismatchedHeaderSource(t *testing.T) {
+	server := newSuccessServer(t)
+	defer server.Close()
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	params := baseParams(server.URL)
+	params["subjectTokenSource"] = map[string]interface{}{"type": "header", "name": "X-Original-Token", "prefix": ""}
+	reqCtx := newRequestContext(map[string][]string{"X-Original-Token": {"original-client-token"}}, "/pets")
+	result := p.OnRequestBody(context.Background(), reqCtx, params)
+
+	action, ok := result.(policy.UpstreamRequestModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestModifications, got %T: %+v", result, result)
+	}
+	if got := action.HeadersToSet["Authorization"]; got != "Bearer exchanged-token" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer exchanged-token")
+	}
+	if len(action.HeadersToRemove) != 1 || action.HeadersToRemove[0] != "X-Original-Token" {
+		t.Errorf("HeadersToRemove = %v, want [X-Original-Token]", action.HeadersToRemove)
+	}
+}
+
+// TestOnRequestBody_NoRedundantRemovalWhenSourceEqualsUpstreamHeader guards
+// against ever placing the same canonical header name in both HeadersToSet
+// and HeadersToRemove: when subjectTokenSource and the upstream header are
+// the same name (the default config), HeadersToSet already overwrites the
+// original value, so no removal entry should be added alongside it.
+func TestOnRequestBody_NoRedundantRemovalWhenSourceEqualsUpstreamHeader(t *testing.T) {
+	server := newSuccessServer(t)
+	defer server.Close()
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	reqCtx := newRequestContext(map[string][]string{"Authorization": {"Bearer original-client-token"}}, "/pets")
+	result := p.OnRequestBody(context.Background(), reqCtx, baseParams(server.URL))
+
+	action, ok := result.(policy.UpstreamRequestModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestModifications, got %T: %+v", result, result)
+	}
+	if len(action.HeadersToRemove) != 0 {
+		t.Errorf("expected no HeadersToRemove when subjectTokenSource and header share a name, got %v", action.HeadersToRemove)
+	}
+}
+
+func TestOnRequestBody_RemovesQueryParameterSource(t *testing.T) {
+	server := newSuccessServer(t)
+	defer server.Close()
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	params := baseParams(server.URL)
+	params["subjectTokenSource"] = map[string]interface{}{"type": "queryParameter", "name": "access_token"}
+	reqCtx := newRequestContext(map[string][]string{}, "/pets?access_token=original-client-token")
+	result := p.OnRequestBody(context.Background(), reqCtx, params)
+
+	action, ok := result.(policy.UpstreamRequestModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestModifications, got %T: %+v", result, result)
+	}
+	if len(action.QueryParametersToRemove) != 1 || action.QueryParametersToRemove[0] != "access_token" {
+		t.Errorf("QueryParametersToRemove = %v, want [access_token]", action.QueryParametersToRemove)
+	}
+}
+
+func TestOnRequestBody_RemovesCookieSource_SingleCookie(t *testing.T) {
+	server := newSuccessServer(t)
+	defer server.Close()
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	params := baseParams(server.URL)
+	params["subjectTokenSource"] = map[string]interface{}{"type": "cookie", "name": "session"}
+	reqCtx := newRequestContext(map[string][]string{"Cookie": {"session=original-client-token"}}, "/pets")
+	result := p.OnRequestBody(context.Background(), reqCtx, params)
+
+	action, ok := result.(policy.UpstreamRequestModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestModifications, got %T: %+v", result, result)
+	}
+	if len(action.HeadersToRemove) != 1 || action.HeadersToRemove[0] != "Cookie" {
+		t.Errorf("HeadersToRemove = %v, want [Cookie]", action.HeadersToRemove)
+	}
+	if _, set := action.HeadersToSet["Cookie"]; set {
+		t.Errorf("expected no Cookie override when nothing remains, got %q", action.HeadersToSet["Cookie"])
+	}
+}
+
+func TestOnRequestBody_RemovesCookieSource_PreservesOtherCookies(t *testing.T) {
+	server := newSuccessServer(t)
+	defer server.Close()
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	params := baseParams(server.URL)
+	params["subjectTokenSource"] = map[string]interface{}{"type": "cookie", "name": "session"}
+	reqCtx := newRequestContext(map[string][]string{"Cookie": {"session=original-client-token; other=xyz"}}, "/pets")
+	result := p.OnRequestBody(context.Background(), reqCtx, params)
+
+	action, ok := result.(policy.UpstreamRequestModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestModifications, got %T: %+v", result, result)
+	}
+	if len(action.HeadersToRemove) != 0 {
+		t.Errorf("expected no HeadersToRemove, got %v", action.HeadersToRemove)
+	}
+	if got := action.HeadersToSet["Cookie"]; got != "other=xyz" {
+		t.Errorf("Cookie = %q, want %q", got, "other=xyz")
+	}
+}
+
+func TestOnRequestBody_KeepsSubjectTokenSource_WhenForwardTokenEnabled(t *testing.T) {
+	server := newSuccessServer(t)
+	defer server.Close()
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	params := baseParams(server.URL)
+	params["subjectTokenSource"] = map[string]interface{}{
+		"type":         "header",
+		"name":         "X-Original-Token",
+		"prefix":       "",
+		"forwardToken": true,
+	}
+	reqCtx := newRequestContext(map[string][]string{"X-Original-Token": {"original-client-token"}}, "/pets")
+	result := p.OnRequestBody(context.Background(), reqCtx, params)
+
+	action, ok := result.(policy.UpstreamRequestModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestModifications, got %T: %+v", result, result)
+	}
+	if len(action.HeadersToRemove) != 0 {
+		t.Errorf("expected no HeadersToRemove when forwardToken is true, got %v", action.HeadersToRemove)
+	}
+	if len(action.QueryParametersToRemove) != 0 {
+		t.Errorf("expected no QueryParametersToRemove when forwardToken is true, got %v", action.QueryParametersToRemove)
+	}
+	if _, set := action.HeadersToSet["Cookie"]; set {
+		t.Error("expected no Cookie override when forwardToken is true")
+	}
+}
+
 // ─── OnRequestBody: fail-closed paths ────────────────────────────────────
 
 func TestOnRequestBody_MissingSubjectToken_ReturnsUnauthorized(t *testing.T) {
@@ -490,6 +647,34 @@ func TestOnRequestHeaders_InvalidConfig_RejectsImmediately(t *testing.T) {
 	}
 	if headerPhaseSucceeded(shared) {
 		t.Error("expected headerPhaseSucceeded to be false on invalid config")
+	}
+}
+
+// TestOnRequestHeaders_RemovesMismatchedHeaderSource verifies the header
+// phase computes its own removal mods independently of
+// OnRequestBody/upstreamAction — it builds the UpstreamRequestHeaderModifications
+// action directly rather than delegating to upstreamAction.
+func TestOnRequestHeaders_RemovesMismatchedHeaderSource(t *testing.T) {
+	server := newSuccessServer(t)
+	defer server.Close()
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	shared := newSharedContext()
+	params := baseParams(server.URL)
+	params["subjectTokenSource"] = map[string]interface{}{"type": "header", "name": "X-Original-Token", "prefix": ""}
+	headerCtx := newRequestHeaderContext(shared, map[string][]string{"X-Original-Token": {"original-client-token"}}, "/pets")
+	result := p.OnRequestHeaders(context.Background(), headerCtx, params)
+
+	action, ok := result.(policy.UpstreamRequestHeaderModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestHeaderModifications, got %T: %+v", result, result)
+	}
+	if got := action.HeadersToSet["Authorization"]; got != "Bearer exchanged-token" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer exchanged-token")
+	}
+	if len(action.HeadersToRemove) != 1 || action.HeadersToRemove[0] != "X-Original-Token" {
+		t.Errorf("HeadersToRemove = %v, want [X-Original-Token]", action.HeadersToRemove)
 	}
 }
 
@@ -716,6 +901,38 @@ func TestExtractSubjectToken_QueryParameter(t *testing.T) {
 	tok, ok := extractSubjectToken(reqCtx.Headers, reqCtx.Path, subjectTokenSource{kind: "queryParameter", name: "access_token"})
 	if !ok || tok != "abc123" {
 		t.Errorf("got (%q, %v), want (abc123, true)", tok, ok)
+	}
+}
+
+// ─── stripCookieByName ───────────────────────────────────────────────────────
+
+func TestStripCookieByName_RemovesOnlyMatchingCookie(t *testing.T) {
+	remaining, removedAll := stripCookieByName([]string{"session=abc123; other=xyz"}, "session")
+	if removedAll {
+		t.Fatal("expected removedAll = false, since other=xyz remains")
+	}
+	if remaining != "other=xyz" {
+		t.Errorf("remaining = %q, want %q", remaining, "other=xyz")
+	}
+}
+
+func TestStripCookieByName_RemovesAllWhenOnlyCookiePresent(t *testing.T) {
+	remaining, removedAll := stripCookieByName([]string{"session=abc123"}, "session")
+	if !removedAll {
+		t.Fatal("expected removedAll = true when no cookies remain")
+	}
+	if remaining != "" {
+		t.Errorf("remaining = %q, want empty string", remaining)
+	}
+}
+
+func TestStripCookieByName_NoMatch_LeavesAllCookiesIntact(t *testing.T) {
+	remaining, removedAll := stripCookieByName([]string{"other=xyz"}, "session")
+	if removedAll {
+		t.Fatal("expected removedAll = false when the named cookie isn't present")
+	}
+	if remaining != "other=xyz" {
+		t.Errorf("remaining = %q, want %q", remaining, "other=xyz")
 	}
 }
 

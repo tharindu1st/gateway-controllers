@@ -55,6 +55,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"sort"
@@ -225,6 +226,17 @@ type subjectTokenSource struct {
 	kind   string // "header", "cookie", or "queryParameter"
 	name   string
 	prefix string // only meaningful for kind == "header" (e.g. "Bearer ")
+
+	// forwardToken mirrors the forwardToken boolean already used by jwt-auth
+	// and opaque-token-auth to gate whether a subject's own inbound token is
+	// forwarded upstream (true) or stripped (false) from its original
+	// location. The default here is intentionally inverted (false) relative
+	// to those policies' default of true: their upstream credential IS the
+	// forwarded token, whereas this policy's upstream credential is the
+	// newly exchanged token already set on cfg.header, so the original
+	// subject credential is an incidental extraction artifact that should
+	// not reach the backend unless explicitly requested.
+	forwardToken bool
 }
 
 // exchangeConfig is the fully parsed, validated policy configuration for one
@@ -319,9 +331,10 @@ func parseConfig(params map[string]interface{}) (*exchangeConfig, error) {
 
 	sourceRaw := objectParam(params, "subjectTokenSource")
 	cfg.subjectSource = subjectTokenSource{
-		kind:   getStringFromMap(sourceRaw, "type", "header"),
-		name:   getStringFromMap(sourceRaw, "name", defaultHeader),
-		prefix: getStringFromMapOrDefault(sourceRaw, "prefix", defaultHeaderPrefix),
+		kind:         getStringFromMap(sourceRaw, "type", "header"),
+		name:         getStringFromMap(sourceRaw, "name", defaultHeader),
+		prefix:       getStringFromMapOrDefault(sourceRaw, "prefix", defaultHeaderPrefix),
+		forwardToken: getBoolFromMap(sourceRaw, "forwardToken", false),
 	}
 	switch cfg.subjectSource.kind {
 	case "header", "cookie", "queryParameter":
@@ -405,8 +418,13 @@ func (p *OAuthTokenExchangePolicy) OnRequestHeaders(ctx context.Context, reqCtx 
 	}
 
 	markHeaderPhaseOutcome(reqCtx.SharedContext, headerPhaseOutcomeSucceeded)
+	headersToSet := map[string]string{cfg.header: cfg.headerPrefix + token}
+	headersToRemove, queryParamsToRemove, cookieOverride := subjectTokenRemovalMods(cfg, reqCtx.Headers)
+	maps.Copy(headersToSet, cookieOverride)
 	return policy.UpstreamRequestHeaderModifications{
-		HeadersToSet: map[string]string{cfg.header: cfg.headerPrefix + token},
+		HeadersToSet:            headersToSet,
+		HeadersToRemove:         headersToRemove,
+		QueryParametersToRemove: queryParamsToRemove,
 	}
 }
 
@@ -461,7 +479,7 @@ func (p *OAuthTokenExchangePolicy) OnRequestBody(ctx context.Context, reqCtx *po
 	}
 
 	slog.Debug("OAuth token exchange: exchange succeeded", "phase", "body", "api", reqCtx.APIName, "grantType", cfg.grantType)
-	return upstreamAction(cfg, token)
+	return upstreamAction(cfg, token, reqCtx.Headers)
 }
 
 // badGatewayResponse is the sterile, tracking-ID-bearing 502 payload used by
@@ -524,11 +542,14 @@ func (p *OAuthTokenExchangePolicy) resolveSubjectAndToken(ctx context.Context, p
 	return tok, subjectToken, false, nil
 }
 
-func upstreamAction(cfg *exchangeConfig, token string) policy.RequestAction {
+func upstreamAction(cfg *exchangeConfig, token string, headers *policy.Headers) policy.RequestAction {
+	headersToSet := map[string]string{cfg.header: cfg.headerPrefix + token}
+	headersToRemove, queryParamsToRemove, cookieOverride := subjectTokenRemovalMods(cfg, headers)
+	maps.Copy(headersToSet, cookieOverride)
 	return policy.UpstreamRequestModifications{
-		HeadersToSet: map[string]string{
-			cfg.header: cfg.headerPrefix + token,
-		},
+		HeadersToSet:            headersToSet,
+		HeadersToRemove:         headersToRemove,
+		QueryParametersToRemove: queryParamsToRemove,
 	}
 }
 
@@ -602,6 +623,70 @@ func extractSubjectToken(headers *policy.Headers, path string, src subjectTokenS
 	default:
 		return "", false
 	}
+}
+
+// subjectTokenRemovalMods computes the HeadersToRemove / QueryParametersToRemove
+// / Cookie-header override needed to strip the subject token's source from the
+// upstream request, unless cfg.subjectSource.forwardToken opts out of that.
+// headers is the live request state — the same one extractSubjectToken read
+// from — needed to rebuild the Cookie header for the cookie case.
+func subjectTokenRemovalMods(cfg *exchangeConfig, headers *policy.Headers) (headersToRemove, queryParamsToRemove []string, cookieHeaderOverride map[string]string) {
+	if cfg.subjectSource.forwardToken {
+		return nil, nil, nil
+	}
+
+	switch cfg.subjectSource.kind {
+	case "header":
+		canonicalIn := http.CanonicalHeaderKey(cfg.subjectSource.name)
+		canonicalOut := http.CanonicalHeaderKey(cfg.header)
+		if canonicalIn != canonicalOut {
+			headersToRemove = []string{canonicalIn}
+		}
+		// Same name: HeadersToSet already overwrites it with the exchanged
+		// token, so there is nothing left to remove.
+
+	case "queryParameter":
+		queryParamsToRemove = []string{cfg.subjectSource.name}
+
+	case "cookie":
+		cookieVals := getHeaderCaseInsensitive(headers, "cookie")
+		if len(cookieVals) == 0 {
+			return nil, nil, nil
+		}
+		remaining, removedAll := stripCookieByName(cookieVals, cfg.subjectSource.name)
+		if removedAll {
+			headersToRemove = []string{"Cookie"}
+		} else {
+			cookieHeaderOverride = map[string]string{"Cookie": remaining}
+		}
+	}
+
+	return headersToRemove, queryParamsToRemove, cookieHeaderOverride
+}
+
+// stripCookieByName rebuilds a Cookie header value with every cookie named
+// name removed. There is no SDK primitive for single-cookie removal (only
+// whole-header HeadersToRemove), so this reparses the merged Cookie header
+// value(s) via net/http the same way extractSubjectToken reads a cookie, then
+// rejoins whatever is left. Returns ("", true) when nothing remains, signaling
+// the caller to remove the Cookie header entirely rather than set it empty.
+func stripCookieByName(cookieHeaderValues []string, name string) (string, bool) {
+	header := http.Header{}
+	for _, v := range cookieHeaderValues {
+		header.Add("Cookie", v)
+	}
+	cookies := (&http.Request{Header: header}).Cookies()
+	kept := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		if c.Name == name {
+			continue
+		}
+		kept = append(kept, c.Name+"="+c.Value)
+	}
+	if len(kept) == 0 {
+		return "", true
+	}
+	return strings.Join(kept, "; "), false
 }
 
 // getHeaderCaseInsensitive reads a header by name, falling back to a manual
@@ -924,6 +1009,18 @@ func getStringFromMapOrDefault(m map[string]interface{}, key, defaultVal string)
 
 func getBool(params map[string]interface{}, key string, defaultVal bool) bool {
 	if v, ok := params[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return defaultVal
+}
+
+func getBoolFromMap(m map[string]interface{}, key string, defaultVal bool) bool {
+	if m == nil {
+		return defaultVal
+	}
+	if v, ok := m[key]; ok {
 		if b, ok := v.(bool); ok {
 			return b
 		}

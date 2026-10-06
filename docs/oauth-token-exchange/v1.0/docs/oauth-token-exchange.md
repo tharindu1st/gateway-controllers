@@ -10,7 +10,7 @@ Use this policy when your backend expects a token issued by its own identity pro
 2. It exchanges that credential for a new token by calling the `tokenEndpoint` you configure:
    - **TokenExchange** (default): sends the credential as `subject_token`, per RFC 8693.
    - **JwtBearer**: sends the credential as-is as the `assertion`, per RFC 7523.
-3. On success, the exchanged token is attached to the request on the configured upstream `header` (default: `Authorization: Bearer <token>`) and cached in memory so the same caller doesn't trigger a new exchange on every request (see [Token Caching](#token-caching)).
+3. On success, the exchanged token is attached to the request on the configured upstream `header` (default: `Authorization: Bearer <token>`) and cached in memory so the same caller doesn't trigger a new exchange on every request (see [Token Caching](#token-caching)). By default, the caller's original credential is also stripped from wherever it was read — the header, cookie, or query parameter named by `subjectTokenSource` — before the request goes upstream. Set `subjectTokenSource.forwardToken: true` to leave it in place instead.
 
 If the caller doesn't present a credential, the request is rejected with a generic `401 Unauthorized`. If the token endpoint is unreachable, returns an error, or returns a malformed response, the request is rejected with a generic `502 Bad Gateway`. In both cases, the caller's original credential is never forwarded to your backend as a fallback — a failed exchange always fails the request rather than silently degrading security.
 
@@ -25,14 +25,14 @@ If the caller doesn't present a credential, the request is rejected with a gener
 | `clientId` | string | — | OAuth2 client identifier used to authenticate to the token endpoint. |
 | `clientSecret` | string | — | OAuth2 client secret paired with `clientId`. |
 | `clientAuthMethod` | string | `ClientSecretBasic` | `ClientSecretBasic` (HTTP Basic auth) or `ClientSecretPost` (form fields). |
-| `subjectTokenSource` | object | `{type: header, name: Authorization, prefix: "Bearer "}` | Where to read the caller's credential from — `header`, `cookie`, or `queryParameter`. |
+| `subjectTokenSource` | object | `{type: header, name: Authorization, prefix: "Bearer ", forwardToken: false}` | Where to read the caller's credential from — `header`, `cookie`, or `queryParameter`. `forwardToken: false` (default) strips it from the request after it's read; set to `true` to also leave it in place. |
 | `subjectTokenType` | string | `AccessToken` | Type of the inbound credential: `AccessToken`, `Jwt`, or `IdToken`. |
 | `requestedTokenType` | string | _(unset)_ | Requested type of the issued token. `TokenExchange` only. |
 | `audiences` | string[] | `[]` | Sent as repeated `audience` parameters. |
 | `scopes` | string[] | `[]` | Space-joined into the `scope` parameter. |
 | `resources` | string[] | `[]` | RFC 8707 resource indicators, sent as repeated `resource` parameters. |
 | `header` | string | `Authorization` | Upstream header to set the exchanged token on. |
-| `headerPrefix` | string | `Bearer ` | Prefix prepended to the exchanged token. Set to `""` for none. |
+| `headerPrefix` | string | `"Bearer "` | Prefix prepended to the exchanged token. Set to `""` for none. |
 | `tokenCaching` | boolean | `true` | Cache exchanged tokens in memory to avoid a token-endpoint call on every request. |
 
 ### System Parameters
