@@ -570,6 +570,12 @@ func TestOnRequestHeaders_Success_SetsHeaderAndMarksSucceeded(t *testing.T) {
 	if !headerPhaseSucceeded(shared) {
 		t.Error("expected headerPhaseSucceeded to be true after a successful header-phase exchange")
 	}
+	if !subjectTokenHashMatches(shared, "original-client-token") {
+		t.Error("expected the stored subject token hash to match the token actually exchanged")
+	}
+	if subjectTokenHashMatches(shared, "a-different-token") {
+		t.Error("expected the stored subject token hash not to match a different token")
+	}
 }
 
 func TestOnRequestHeaders_SubjectTokenMissing_DefersWithoutRejecting(t *testing.T) {
@@ -716,6 +722,105 @@ func TestOnRequestBody_SkipsExchangeWhenHeaderPhaseSucceeded(t *testing.T) {
 	}
 	if atomic.LoadInt32(&hits) != 1 {
 		t.Errorf("expected no additional token endpoint call from OnRequestBody, got %d total", hits)
+	}
+}
+
+// TestOnRequestBody_ReExchangesWhenSubjectTokenChangedSinceHeaderPhase covers
+// the staleness scenario storeSubjectTokenHash/subjectTokenHashMatches exist
+// to close: an earlier-in-chain body-phase policy rewrites the same header
+// the header phase already exchanged from, after that header-phase exchange
+// already ran and attached its result upstream. OnRequestBody must detect
+// the mismatch and re-exchange against the new value rather than trusting
+// the stale one.
+func TestOnRequestBody_ReExchangesWhenSubjectTokenChangedSinceHeaderPhase(t *testing.T) {
+	var hits int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token": "exchanged-" + r.PostForm.Get("subject_token"),
+			"expires_in":   300,
+		})
+	}))
+	defer server.Close()
+	utils.SetSharedHTTPClient(server.Client())
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	shared := newSharedContext()
+	params := baseParams(server.URL)
+
+	headerCtx := newRequestHeaderContext(shared, map[string][]string{"Authorization": {"Bearer original-client-token"}}, "/pets")
+	headerResult, ok := p.OnRequestHeaders(context.Background(), headerCtx, params).(policy.UpstreamRequestHeaderModifications)
+	if !ok {
+		t.Fatal("expected the header phase to succeed")
+	}
+	if got := headerResult.HeadersToSet["Authorization"]; got != "Bearer exchanged-original-client-token" {
+		t.Errorf("header-phase Authorization = %q, want %q", got, "Bearer exchanged-original-client-token")
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("expected exactly 1 token endpoint call after the header phase, got %d", hits)
+	}
+
+	// An earlier-in-chain body-phase policy has since rewritten the same
+	// header to a different credential.
+	bodyCtx := newRequestContextSharing(shared, map[string][]string{"Authorization": {"Bearer rotated-client-token"}}, "/pets")
+	result := p.OnRequestBody(context.Background(), bodyCtx, params)
+
+	action, ok := result.(policy.UpstreamRequestModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestModifications, got %T: %+v", result, result)
+	}
+	if got := action.HeadersToSet["Authorization"]; got != "Bearer exchanged-rotated-client-token" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer exchanged-rotated-client-token")
+	}
+	if atomic.LoadInt32(&hits) != 2 {
+		t.Errorf("expected a second token endpoint call for the changed subject token, got %d total", hits)
+	}
+}
+
+// TestOnRequestBody_ReExchangesWhenSubjectTokenDisappearedSinceHeaderPhase
+// covers the symmetric case: the credential the header phase successfully
+// exchanged is no longer present at all by the body phase (e.g. an
+// earlier-in-chain policy stripped it). OnRequestBody must not trust the
+// stale header-phase result and must fail closed instead.
+func TestOnRequestBody_ReExchangesWhenSubjectTokenDisappearedSinceHeaderPhase(t *testing.T) {
+	var hits int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "exchanged-token", "expires_in": 300})
+	}))
+	defer server.Close()
+	utils.SetSharedHTTPClient(server.Client())
+	defer utils.SetSharedHTTPClient(nil)
+
+	p := newTestPolicy()
+	shared := newSharedContext()
+	params := baseParams(server.URL)
+
+	headerCtx := newRequestHeaderContext(shared, map[string][]string{"Authorization": {"Bearer original-client-token"}}, "/pets")
+	if _, ok := p.OnRequestHeaders(context.Background(), headerCtx, params).(policy.UpstreamRequestHeaderModifications); !ok {
+		t.Fatal("expected the header phase to succeed")
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("expected exactly 1 token endpoint call after the header phase, got %d", hits)
+	}
+
+	// An earlier-in-chain body-phase policy has since removed the header.
+	bodyCtx := newRequestContextSharing(shared, map[string][]string{}, "/pets")
+	result := p.OnRequestBody(context.Background(), bodyCtx, params)
+
+	resp, ok := result.(policy.ImmediateResponse)
+	if !ok {
+		t.Fatalf("expected ImmediateResponse, got %T: %+v", result, result)
+	}
+	if resp.StatusCode != 401 {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Errorf("expected no additional token endpoint call once the subject token disappeared, got %d total", hits)
 	}
 }
 
@@ -985,6 +1090,37 @@ func TestValidate_ValidConfig(t *testing.T) {
 	if err := p.Validate(baseParams("https://example.com/token")); err != nil {
 		t.Errorf("unexpected error for valid config: %v", err)
 	}
+}
+
+// ─── storeSubjectTokenHash / subjectTokenHashMatches ────────────────────────
+
+func TestSubjectTokenHashMatches_NoStoredHash(t *testing.T) {
+	shared := newSharedContext()
+	if subjectTokenHashMatches(shared, "any-token") {
+		t.Error("expected no match when no hash has been stored yet")
+	}
+}
+
+func TestSubjectTokenHashMatches_NilSharedContext(t *testing.T) {
+	if subjectTokenHashMatches(nil, "any-token") {
+		t.Error("expected no match against a nil SharedContext")
+	}
+}
+
+func TestStoreSubjectTokenHash_RoundTrips(t *testing.T) {
+	shared := newSharedContext()
+	storeSubjectTokenHash(shared, "abc123")
+
+	if !subjectTokenHashMatches(shared, "abc123") {
+		t.Error("expected the stored hash to match the same token")
+	}
+	if subjectTokenHashMatches(shared, "different-token") {
+		t.Error("expected the stored hash not to match a different token")
+	}
+}
+
+func TestStoreSubjectTokenHash_NilSharedContext_DoesNotPanic(t *testing.T) {
+	storeSubjectTokenHash(nil, "abc123") // must not panic
 }
 
 // ─── buildCacheKey ────────────────────────────────────────────────────────

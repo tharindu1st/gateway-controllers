@@ -33,10 +33,17 @@
 // proceeds, so an earlier-in-chain, body-phase auth policy still gets to run
 // and, if it forwards the credential under a different header, supply what
 // the header phase could not find. OnRequestBody then makes the sole
-// authoritative attempt: if the header phase already succeeded it does
-// nothing further, and otherwise it repeats the extraction-and-exchange
-// against the now-fully-formed live request state and, only at that point,
-// fails the request if it still cannot complete the exchange.
+// authoritative attempt: if the header phase already succeeded, it first
+// re-validates that the subject token is still the same one that was
+// exchanged there (by comparing against a hash recorded in
+// SharedContext.Metadata) before treating it as a no-op — an earlier-in-chain
+// body-phase policy can rewrite the same header/cookie/query parameter
+// after the header phase already ran, which would otherwise leave a stale
+// exchange attached upstream. A changed or missing subject token, or a
+// header phase that deferred or never ran, all fall through to the same
+// extraction-and-exchange against the now-fully-formed live request state,
+// and only at that point does the request fail if it still cannot complete
+// the exchange.
 //
 // This policy still implements policy.RequestPolicy (OnRequestBody), so the
 // kernel still buffers the complete request body for every route it is
@@ -115,7 +122,9 @@ const (
 	metadataKeyHeaderPhaseOutcome = "oauthTokenExchange.headerPhaseOutcome"
 
 	// headerPhaseOutcomeSucceeded means the header phase already resolved and
-	// attached the exchanged token upstream; OnRequestBody is a no-op.
+	// attached the exchanged token upstream. OnRequestBody treats this as a
+	// no-op only after confirming the subject token hasn't changed since,
+	// via metadataKeySubjectTokenHash — otherwise it re-exchanges.
 	headerPhaseOutcomeSucceeded = "succeeded"
 
 	// headerPhaseOutcomeDeferred means the subject token was not yet present
@@ -143,6 +152,54 @@ func headerPhaseSucceeded(shared *policy.SharedContext) bool {
 	}
 	outcome, _ := shared.Metadata[metadataKeyHeaderPhaseOutcome].(string)
 	return outcome == headerPhaseOutcomeSucceeded
+}
+
+// metadataKeySubjectTokenHash stores a SHA-256 hash (never the raw
+// credential) of the subject token used to perform the header-phase
+// exchange. The header phase runs before any body-phase policy in the
+// chain, so it cannot know whether an earlier-in-chain body-phase policy
+// will go on to rewrite the same header/cookie/query parameter afterward
+// (e.g. normalizing or replacing the caller's credential). OnRequestBody
+// re-extracts the live subject token and compares its hash against this
+// value before trusting the header-phase result: a match means nothing
+// changed and the exchange already attached upstream is still correct; a
+// mismatch (or the subject token disappearing entirely) means it is not,
+// and OnRequestBody repeats the exchange against the current value instead.
+const metadataKeySubjectTokenHash = "oauthTokenExchange.subjectTokenHash"
+
+func storeSubjectTokenHash(shared *policy.SharedContext, subjectToken string) {
+	if shared == nil {
+		return
+	}
+	if shared.Metadata == nil {
+		shared.Metadata = map[string]interface{}{}
+	}
+	shared.Metadata[metadataKeySubjectTokenHash] = hashSubjectToken(subjectToken)
+}
+
+// subjectTokenHashMatches reports whether currentToken hashes to the same
+// value storeSubjectTokenHash recorded during the header phase. A missing
+// stored hash (e.g. headerPhaseSucceeded is somehow true without one, which
+// should never happen) is treated as a mismatch — fail safe into a fresh
+// exchange rather than trusting a result with nothing to compare against.
+func subjectTokenHashMatches(shared *policy.SharedContext, currentToken string) bool {
+	if shared == nil || shared.Metadata == nil {
+		return false
+	}
+	stored, _ := shared.Metadata[metadataKeySubjectTokenHash].(string)
+	if stored == "" {
+		return false
+	}
+	return stored == hashSubjectToken(currentToken)
+}
+
+// hashSubjectToken returns a fixed-length SHA-256 digest of the subject
+// token — never the raw token — so it can be compared across phases via
+// SharedContext.Metadata without storing the credential itself, mirroring
+// buildCacheKey's own handling of the subject token.
+func hashSubjectToken(subjectToken string) string {
+	sum := sha256.Sum256([]byte(subjectToken))
+	return hex.EncodeToString(sum[:])
 }
 
 // OAuthTokenExchangePolicy exchanges the caller's inbound credential for a
@@ -418,6 +475,7 @@ func (p *OAuthTokenExchangePolicy) OnRequestHeaders(ctx context.Context, reqCtx 
 	}
 
 	markHeaderPhaseOutcome(reqCtx.SharedContext, headerPhaseOutcomeSucceeded)
+	storeSubjectTokenHash(reqCtx.SharedContext, subjectToken)
 	headersToSet := map[string]string{cfg.header: cfg.headerPrefix + token}
 	headersToRemove, queryParamsToRemove, cookieOverride := subjectTokenRemovalMods(cfg, reqCtx.Headers)
 	maps.Copy(headersToSet, cookieOverride)
@@ -432,21 +490,34 @@ func (p *OAuthTokenExchangePolicy) OnRequestHeaders(ctx context.Context, reqCtx 
 // rejected once the header phase has deferred it — every other failure mode
 // (invalid config, or an exchange call that actually failed) was already
 // rejected directly in OnRequestHeaders and never reaches here at all. If
-// the header phase already succeeded, there is nothing left to do — the
-// upstream header was already set there. Otherwise this makes the full,
-// authoritative attempt against the now-fully-formed live request state,
-// and on failure rejects the request: the original subject token is never
-// forwarded upstream, and no internal detail (upstream error body, resolved
-// host, stack trace) reaches the client.
+// the header phase already succeeded, this re-validates that the subject
+// token is still what it was at that point — via the hash stored by
+// storeSubjectTokenHash — before trusting it as a no-op: a body-phase policy
+// earlier in the chain can still rewrite the same header/cookie/query
+// parameter after the header phase already ran (see
+// metadataKeySubjectTokenHash's doc comment). Only a confirmed match skips
+// the rest of this function; a mismatch, or the subject token disappearing
+// entirely, falls through to the same full, authoritative attempt made when
+// the header phase deferred or never ran, and on failure rejects the
+// request: the original subject token is never forwarded upstream, and no
+// internal detail (upstream error body, resolved host, stack trace) reaches
+// the client.
 func (p *OAuthTokenExchangePolicy) OnRequestBody(ctx context.Context, reqCtx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
-	if headerPhaseSucceeded(reqCtx.SharedContext) {
-		return policy.UpstreamRequestModifications{}
-	}
-
 	cfg, err := parseConfig(params)
 	if err != nil {
 		slog.Error("OAuth token exchange: invalid policy configuration", "phase", "body", "error", err)
 		return internalError()
+	}
+
+	if headerPhaseSucceeded(reqCtx.SharedContext) {
+		if currentToken, ok := extractSubjectToken(reqCtx.Headers, reqCtx.Path, cfg.subjectSource); ok && subjectTokenHashMatches(reqCtx.SharedContext, currentToken) {
+			return policy.UpstreamRequestModifications{}
+		}
+		slog.Debug("OAuth token exchange: subject token changed since header phase, re-exchanging",
+			"api", reqCtx.APIName,
+			"source", cfg.subjectSource.kind,
+			"name", cfg.subjectSource.name,
+		)
 	}
 
 	token, subjectToken, subjectMissing, exchangeErr := p.resolveSubjectAndToken(ctx, "body", reqCtx.APIName, cfg, reqCtx.Headers, reqCtx.Path)
