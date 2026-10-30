@@ -1,0 +1,10 @@
+{
+  "name": "oauth2-session",
+  "displayName": "OAuth2 Session",
+  "version": "0.1",
+  "provider": "WSO2",
+  "categories": [
+    "Security"
+  ],
+  "description": "Logs browser users in with the OAuth 2.0 authorization code grant and keeps their tokens on the gateway.\nThe browser only holds an opaque, signed session cookie; access and refresh tokens are stored encrypted in Redis, refreshed before they expire, and sent to the backend as a bearer token. The policy answers the login, callback and logout routes itself and requires a session on every other operation."
+}

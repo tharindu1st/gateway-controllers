@@ -1,0 +1,10 @@
+{
+  "name": "oauth2-session-backchannel-logout",
+  "displayName": "OAuth2 Session Back-Channel Logout",
+  "version": "0.1",
+  "provider": "WSO2",
+  "categories": [
+    "Security"
+  ],
+  "description": "Receives OpenID Connect Back-Channel Logout requests from the identity provider and ends the matching OAuth2 Session sessions.\nValidates the signed logout token against the identity provider's JWKS, then deletes every gateway session of the identity provider session (sid) or user (sub) it names. Each logout token is accepted once."
+}

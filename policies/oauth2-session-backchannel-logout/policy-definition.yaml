@@ -1,0 +1,147 @@
+name: oauth2-session-backchannel-logout
+version: v0.1.0
+displayName: OAuth2 Session Back-Channel Logout
+description: |
+  Receives OpenID Connect Back-Channel Logout requests from the identity
+  provider and ends the matching oauth2-session sessions. Validates the
+  signed logout token, then deletes every session of the identity
+  provider session (sid) or user (sub) it names. Attach it to a single
+  POST operation in an API without oauth2-session; it answers the request
+  itself and never calls the backend.
+
+parameters:
+  type: object
+  additionalProperties: false
+  required:
+    - issuer
+    - jwksUri
+    - clientId
+  properties:
+    issuer:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Identity provider issuer identifier. Must equal the iss claim of
+        logout tokens and the issuer parameter of oauth2-session.
+    jwksUri:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: URL of the identity provider's JSON Web Key Set.
+    clientId:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        OAuth2 client ID used by oauth2-session. Logout tokens must list
+        it in aud.
+    allowedAlgorithms:
+      type: array
+      x-wso2-policy-advanced-param: true
+      items:
+        type: string
+        enum: [RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512]
+      description: Signing algorithms accepted for logout tokens.
+      default: ["RS256"]
+    clockSkew:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: Allowed clock difference with the identity provider (Go duration).
+      default: "60s"
+    maxTokenAge:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Oldest logout token accepted, measured from its iat claim (Go
+        duration).
+      default: "5m"
+    jwksCacheTTL:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        How long fetched keys are reused before the JWKS is fetched again
+        (Go duration). An unknown kid also triggers a fetch.
+      default: "10m"
+    jwksRequestTimeout:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: Timeout for a JWKS request (Go duration).
+      default: "5s"
+
+systemParameters:
+  type: object
+  additionalProperties: false
+  description: >
+    Operator-level Redis settings. They default to the oauth2-session
+    section, config.policy_configurations.oauth2_session_v0.redis.*, so
+    both policies use the same Redis, database and key prefix.
+  properties:
+    redis:
+      type: object
+      additionalProperties: false
+      properties:
+        host:
+          type: string
+          description: Redis host name or IP address.
+          default: "localhost"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.host}"
+
+        port:
+          type: integer
+          description: Redis server port.
+          minimum: 1
+          maximum: 65535
+          default: 6379
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.port}"
+
+        password:
+          type: string
+          description: Optional Redis authentication password.
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.password}"
+
+        username:
+          type: string
+          description: Optional Redis ACL username.
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.username}"
+
+        db:
+          type: integer
+          description: Redis database index.
+          minimum: 0
+          maximum: 15
+          default: 0
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.db}"
+
+        keyPrefix:
+          type: string
+          description: Key prefix; must equal the one oauth2-session uses.
+          default: "oauth2-session:v1:"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.key_prefix}"
+
+        connectionTimeout:
+          type: string
+          description: Redis connection timeout (Go duration, e.g. "5s").
+          default: "5s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.connection_timeout}"
+
+        readTimeout:
+          type: string
+          description: Redis read timeout (Go duration, e.g. "3s").
+          default: "3s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.read_timeout}"
+
+        writeTimeout:
+          type: string
+          description: Redis write timeout (Go duration, e.g. "3s").
+          default: "3s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.write_timeout}"
+
+        poolSize:
+          type: integer
+          description: |
+            Redis connection pool size. 0 = go-redis default (10 x
+            GOMAXPROCS).
+          minimum: 0
+          default: 0
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.pool_size}"
