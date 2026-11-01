@@ -5,10 +5,11 @@ description: |
   Logs browser users in with the OAuth 2.0 authorization code grant and
   keeps their tokens on the gateway. The browser only holds an opaque,
   signed session cookie; access and refresh tokens are stored encrypted
-  in Redis, refreshed before they expire, and sent to the backend as a
-  bearer token. Attach it at API level and declare the login, callback
-  and logout paths as GET operations; every other operation requires a
-  session.
+  in Redis and refreshed before they expire. Attach it to the login,
+  callback, logout, session, check-session and refresh operations; it
+  answers them itself. Backend operations take oauth2-session-proxy,
+  which sends the session's access token upstream as a bearer token.
+  Any other operation this policy is attached to answers 404.
 
 parameters:
   type: object
@@ -108,8 +109,44 @@ parameters:
       type: string
       x-wso2-policy-advanced-param: false
       pattern: "^/"
-      description: Operation path that ends the session. Declare it as a GET operation.
+      description: |
+        Operation path that ends the session. GET answers with a 302 to the
+        logout destination; POST (the ThunderID SDK backend-mode signOut)
+        answers 200 {"redirectUrl": "<destination>"}. The destination is the
+        endSessionEndpoint logout URL when set, otherwise postLogoutRedirect.
+        Declare it as a GET and/or POST operation.
       default: "/logout"
+    checkSessionPath:
+      type: string
+      x-wso2-policy-advanced-param: false
+      pattern: "^/"
+      description: |
+        Operation path of the ThunderID SDK backend-mode checkSession
+        endpoint. Returns the same payload as userinfoPath, but neither
+        extends the idle timeout nor refreshes, so polling it doesn't keep
+        an abandoned session alive. Declare it as a GET operation to use it.
+      default: "/checksession"
+    userinfoPath:
+      type: string
+      x-wso2-policy-advanced-param: false
+      pattern: "^/"
+      description: |
+        Operation path of the ThunderID SDK backend-mode session endpoint:
+        200 {"isSignedIn": true, "user": <claims of the cached id_token>,
+        "expiresAt": <access token expiry, unix seconds>}, or 200
+        {"isSignedIn": false} without a session. The identity provider is
+        not called. Declare it as a GET operation to use it.
+      default: "/userinfo"
+    refreshPath:
+      type: string
+      x-wso2-policy-advanced-param: false
+      pattern: "^/"
+      description: |
+        Operation path of the ThunderID SDK backend-mode refresh endpoint.
+        POST refreshes the access token with the refresh token held in Redis
+        and answers 204, re-issuing the session cookie; without a session it
+        answers 401. A token obtained within refreshCooldown is kept. Declare it as a POST operation to use it.
+      default: "/refresh"
     postLoginRedirect:
       type: string
       x-wso2-policy-advanced-param: false
@@ -199,6 +236,14 @@ parameters:
         How long before expiry the access token is refreshed (Go
         duration, e.g. "5m").
       default: "5m"
+    refreshCooldown:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        POST refreshPath keeps an access token obtained less than this
+        long ago instead of refreshing it, so repeated calls can't make
+        each one a refresh (Go duration, e.g. "30s").
+      default: "30s"
     stateTTL:
       type: string
       x-wso2-policy-advanced-param: true
@@ -213,19 +258,6 @@ parameters:
         Access token lifetime assumed when the token response omits
         expires_in (Go duration, e.g. "1h").
       default: "1h"
-    upstreamHeaderName:
-      type: string
-      x-wso2-policy-advanced-param: true
-      minLength: 1
-      description: Header on the backend request that carries the access token.
-      default: "Authorization"
-    upstreamValuePrefix:
-      type: string
-      x-wso2-policy-advanced-param: true
-      description: |
-        Prefix placed before the access token. Use an empty string for
-        no prefix.
-      default: "Bearer"
     tokenRequestTimeout:
       type: string
       x-wso2-policy-advanced-param: true

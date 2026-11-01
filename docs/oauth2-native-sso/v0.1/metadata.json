@@ -1,0 +1,10 @@
+{
+  "name": "oauth2-native-sso",
+  "displayName": "OAuth2 Native SSO",
+  "version": "0.1",
+  "provider": "WSO2",
+  "categories": [
+    "Security"
+  ],
+  "description": "Signs a browser in to an API from the OAuth2 Session login it already has on another API, without a round trip to the identity provider.\nThe other session's id_token and device_secret are exchanged with the OpenID Connect Native SSO token exchange for this API's tokens, which are stored as a new OAuth2 Session session that this API's OAuth2 Session policy then serves."
+}

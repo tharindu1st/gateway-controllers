@@ -38,8 +38,46 @@ type idTokenClaims struct {
 // parseIDTokenClaims decodes the payload of an id_token WITHOUT verifying its signature. That
 // is acceptable only because the token was received directly from the token endpoint over TLS
 // (OpenID Connect Core §3.1.3.7, step 6), and the claims are used only to find this session
-// again at back-channel logout - never to decide whether a request is allowed.
+// again at back-channel logout and to show the user their own claims - never to decide whether a
+// request is allowed.
 func parseIDTokenClaims(raw string) (*idTokenClaims, error) {
+	payload, err := decodeIDTokenPayload(raw)
+	if err != nil {
+		return nil, err
+	}
+	var c idTokenClaims
+	if err := json.Unmarshal(payload, &c); err != nil {
+		return nil, fmt.Errorf("decoding id_token claims: %w", err)
+	}
+	return &c, nil
+}
+
+// protocolClaims are id_token claims about the token itself rather than the user. They are left
+// out of the claims userinfoPath returns.
+var protocolClaims = []string{
+	"iss", "aud", "azp", "exp", "iat", "nbf", "jti", "nonce",
+	"at_hash", "c_hash", "s_hash", "sid", "auth_time", "acr", "amr",
+}
+
+// idTokenUserClaims returns the user claims of an id_token, decoded the same way as
+// parseIDTokenClaims and with protocolClaims removed.
+func idTokenUserClaims(raw string) (map[string]interface{}, error) {
+	payload, err := decodeIDTokenPayload(raw)
+	if err != nil {
+		return nil, err
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims == nil {
+		return nil, fmt.Errorf("decoding id_token claims: id_token payload is not a JSON object")
+	}
+	for _, k := range protocolClaims {
+		delete(claims, k)
+	}
+	return claims, nil
+}
+
+// decodeIDTokenPayload returns the JSON payload of a JWS compact id_token.
+func decodeIDTokenPayload(raw string) ([]byte, error) {
 	if len(raw) > maxIDTokenBytes {
 		return nil, fmt.Errorf("id_token is too large")
 	}
@@ -51,11 +89,7 @@ func parseIDTokenClaims(raw string) (*idTokenClaims, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decoding id_token payload: %w", err)
 	}
-	var c idTokenClaims
-	if err := json.Unmarshal(payload, &c); err != nil {
-		return nil, fmt.Errorf("decoding id_token claims: %w", err)
-	}
-	return &c, nil
+	return payload, nil
 }
 
 // hasAudience reports whether aud, a string or an array of strings, contains clientID.

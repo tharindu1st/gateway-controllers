@@ -40,8 +40,12 @@ func TestParseConfig_Defaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.loginPath != "/login" || c.callbackPath != "/callback" || c.logoutPath != "/logout" {
-		t.Errorf("unexpected default paths: %q %q %q", c.loginPath, c.callbackPath, c.logoutPath)
+	if c.loginPath != "/login" || c.callbackPath != "/callback" || c.logoutPath != "/logout" ||
+		c.checkSessionPath != "/checksession" || c.userinfoPath != "/userinfo" {
+		t.Errorf("unexpected default paths: %q %q %q %q %q", c.loginPath, c.callbackPath, c.logoutPath, c.checkSessionPath, c.userinfoPath)
+	}
+	if c.refreshCooldown != 30*time.Second {
+		t.Errorf("unexpected refresh cooldown default")
 	}
 	if c.cookieName != "X-ABC" || c.stateCookieName != "X-ABC-state" || c.cookieSameSite != SameSiteLax || !c.cookieSecure {
 		t.Errorf("unexpected cookie defaults: %+v", c)
@@ -49,7 +53,7 @@ func TestParseConfig_Defaults(t *testing.T) {
 	if c.idleTimeout != 30*time.Minute || c.absoluteSessionTimeout != 8*time.Hour || c.refreshBuffer != 5*time.Minute {
 		t.Errorf("unexpected timing defaults")
 	}
-	if c.clientAuthMethod != ClientAuthMethodBasic || c.upstreamHeaderName != "Authorization" || c.upstreamValuePrefix != "Bearer" {
+	if c.clientAuthMethod != ClientAuthMethodBasic {
 		t.Errorf("unexpected token defaults")
 	}
 	if len(c.signingKey) != 32 || len(c.encryptionKey) != 32 || string(c.signingKey) == string(c.encryptionKey) {
@@ -64,7 +68,6 @@ func TestParseConfig_NestedAndExplicitValues(t *testing.T) {
 	p := validParams()
 	p["scopes"] = []interface{}{"openid", " orders:read ", ""}
 	p["cookie"] = map[string]interface{}{"name": "__Host-X-ABC", "sameSite": "Strict"}
-	p["upstreamValuePrefix"] = ""
 	p["redis"] = map[string]interface{}{"host": "redis", "port": float64(6380)}
 	c, err := parseConfig(p)
 	if err != nil {
@@ -75,9 +78,6 @@ func TestParseConfig_NestedAndExplicitValues(t *testing.T) {
 	}
 	if c.cookieName != "__Host-X-ABC" || c.cookieSameSite != SameSiteStrict {
 		t.Errorf("cookie = %q %q", c.cookieName, c.cookieSameSite)
-	}
-	if c.upstreamValuePrefix != "" {
-		t.Errorf("explicit empty prefix must be honored")
 	}
 	if c.redis.host != "redis" || c.redis.port != 6380 {
 		t.Errorf("redis = %s:%d", c.redis.host, c.redis.port)
@@ -95,6 +95,10 @@ func TestParseConfig_Rejects(t *testing.T) {
 		"redirectUri path mismatch":  func(p map[string]interface{}) { p["callbackPath"] = "/cb" },
 		"path without slash":         func(p map[string]interface{}) { p["loginPath"] = "login" },
 		"duplicate paths":            func(p map[string]interface{}) { p["logoutPath"] = "/login" },
+		"checkSession duplicates":    func(p map[string]interface{}) { p["checkSessionPath"] = "/logout" },
+		"userinfo duplicates":        func(p map[string]interface{}) { p["userinfoPath"] = "/checksession" },
+		"userinfo without slash":     func(p map[string]interface{}) { p["userinfoPath"] = "userinfo" },
+		"refresh duplicates":         func(p map[string]interface{}) { p["refreshPath"] = "/userinfo" },
 		"absolute postLoginRedirect": func(p map[string]interface{}) { p["postLoginRedirect"] = "https://evil.com" },
 		"protocol-relative redirect": func(p map[string]interface{}) { p["postLogoutRedirect"] = "//evil.com" },
 		"bad clientAuthMethod":       func(p map[string]interface{}) { p["clientAuthMethod"] = "private_key_jwt" },
@@ -125,5 +129,70 @@ func TestParseConfig_ErrorsNeverContainSecrets(t *testing.T) {
 	_, err := parseConfig(p)
 	if err == nil || strings.Contains(err.Error(), "super-secret") {
 		t.Fatalf("error must not echo the secret: %v", err)
+	}
+}
+
+// proxyParams is what an oauth2-session-proxy attachment needs: no login settings.
+func proxyParams() map[string]interface{} {
+	return map[string]interface{}{
+		"tokenEndpoint":      "https://idp.example.com/oauth2/token",
+		"clientId":           "orders-web",
+		"clientSecret":       "client-secret",
+		"sessionSigningKey":  strings.Repeat("s", 32),
+		"tokenEncryptionKey": strings.Repeat("e", 32),
+	}
+}
+
+func TestParseProxyConfig_DefaultsAndValues(t *testing.T) {
+	c, err := parseProxyConfig(proxyParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.refreshOnUpstreamUnauthorized || c.upstreamUnauthorizedCooldown != 30*time.Second || c.continueWithoutCookie {
+		t.Errorf("unexpected upstream 401 defaults")
+	}
+	if c.upstreamHeaderName != "Authorization" || c.upstreamValuePrefix != "Bearer" {
+		t.Errorf("unexpected upstream header defaults")
+	}
+	if c.cookieName != "X-ABC" || c.stateCookieName != "X-ABC-state" || c.idleTimeout != 30*time.Minute ||
+		c.redis.keyPrefix != "oauth2-session:v1:" {
+		t.Errorf("session settings must default as in oauth2-session")
+	}
+	// The same secrets derive the same keys as oauth2-session, so its cookies verify here.
+	s, _ := parseConfig(validParams())
+	if string(c.signingKey) != string(s.signingKey) || string(c.encryptionKey) != string(s.encryptionKey) {
+		t.Errorf("derived keys differ from oauth2-session")
+	}
+
+	p := proxyParams()
+	p["upstreamValuePrefix"] = ""
+	p["upstreamHeaderName"] = "X-Access-Token"
+	if c, err = parseProxyConfig(p); err != nil {
+		t.Fatal(err)
+	}
+	if c.upstreamValuePrefix != "" || c.upstreamHeaderName != "X-Access-Token" {
+		t.Errorf("explicit header settings must be honored")
+	}
+}
+
+func TestParseProxyConfig_Rejects(t *testing.T) {
+	cases := map[string]func(p map[string]interface{}){
+		"missing tokenEndpoint":   func(p map[string]interface{}) { delete(p, "tokenEndpoint") },
+		"missing clientId":        func(p map[string]interface{}) { delete(p, "clientId") },
+		"missing clientSecret":    func(p map[string]interface{}) { delete(p, "clientSecret") },
+		"missing signing key":     func(p map[string]interface{}) { delete(p, "sessionSigningKey") },
+		"short encryption key":    func(p map[string]interface{}) { p["tokenEncryptionKey"] = "short" },
+		"credentials in endpoint": func(p map[string]interface{}) { p["tokenEndpoint"] = "https://u:p@idp/token" },
+		"bad sameSite":            func(p map[string]interface{}) { p["cookie"] = map[string]interface{}{"sameSite": "None"} },
+		"__Host- without secure": func(p map[string]interface{}) {
+			p["cookie"] = map[string]interface{}{"name": "__Host-X", "secure": false}
+		},
+	}
+	for name, mutate := range cases {
+		p := proxyParams()
+		mutate(p)
+		if _, err := parseProxyConfig(p); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
 	}
 }

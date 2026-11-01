@@ -1,0 +1,10 @@
+{
+  "name": "oauth2-session-proxy",
+  "displayName": "OAuth2 Session Proxy",
+  "version": "0.1",
+  "provider": "WSO2",
+  "categories": [
+    "Security"
+  ],
+  "description": "Turns the browser session created by OAuth2 Session into a bearer token on the request sent to the backend.\nThe session's access token is read from Redis, refreshed before it expires, and set in the Authorization header; the session cookies are removed from the upstream request. Attach it to the backend operations, including wildcard proxy routes."
+}

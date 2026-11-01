@@ -36,21 +36,26 @@ const (
 	SameSiteLax    = "Lax"
 	SameSiteStrict = "Strict"
 
-	defaultLoginPath              = "/login"
-	defaultCallbackPath           = "/callback"
-	defaultLogoutPath             = "/logout"
-	defaultPostRedirect           = "/"
-	defaultCookieName             = "X-ABC"
-	defaultStateCookieName        = "X-ABC-state"
-	defaultIdleTimeout            = 30 * time.Minute
-	defaultAbsoluteSessionTimeout = 8 * time.Hour
-	defaultRefreshBuffer          = 5 * time.Minute
-	defaultStateTTL               = 5 * time.Minute
-	defaultTokenTTL               = time.Hour
-	defaultUpstreamHeaderName     = "Authorization"
-	defaultUpstreamValuePrefix    = "Bearer"
-	defaultTokenRequestTimeout    = 10 * time.Second
-	defaultTokenRequestMaxRetries = 2
+	defaultLoginPath                    = "/login"
+	defaultCallbackPath                 = "/callback"
+	defaultLogoutPath                   = "/logout"
+	defaultCheckSessionPath             = "/checksession"
+	defaultUserinfoPath                 = "/userinfo"
+	defaultRefreshPath                  = "/refresh"
+	defaultPostRedirect                 = "/"
+	defaultCookieName                   = "X-ABC"
+	defaultStateCookieName              = "X-ABC-state"
+	defaultIdleTimeout                  = 30 * time.Minute
+	defaultAbsoluteSessionTimeout       = 8 * time.Hour
+	defaultRefreshBuffer                = 5 * time.Minute
+	defaultStateTTL                     = 5 * time.Minute
+	defaultTokenTTL                     = time.Hour
+	defaultUpstreamUnauthorizedCooldown = 30 * time.Second
+	defaultRefreshCooldown              = 30 * time.Second
+	defaultUpstreamHeaderName           = "Authorization"
+	defaultUpstreamValuePrefix          = "Bearer"
+	defaultTokenRequestTimeout          = 10 * time.Second
+	defaultTokenRequestMaxRetries       = 2
 
 	defaultRedisHost              = "localhost"
 	defaultRedisPort              = 6379
@@ -92,6 +97,9 @@ type config struct {
 	loginPath          string
 	callbackPath       string
 	logoutPath         string
+	checkSessionPath   string
+	userinfoPath       string
+	refreshPath        string
 	postLoginRedirect  string
 	postLogoutRedirect string
 
@@ -108,6 +116,13 @@ type config struct {
 	refreshBuffer          time.Duration
 	stateTTL               time.Duration
 	defaultTokenTTL        time.Duration
+
+	refreshCooldown time.Duration // oauth2-session only
+
+	// oauth2-session-proxy only.
+	refreshOnUpstreamUnauthorized bool
+	continueWithoutCookie         bool
+	upstreamUnauthorizedCooldown  time.Duration
 
 	upstreamHeaderName  string
 	upstreamValuePrefix string
@@ -135,32 +150,22 @@ type redisParams struct {
 	poolSize          int
 }
 
-// parseConfig validates params and fills in defaults. Errors name the offending parameter but
-// never echo a secret value.
+// parseConfig validates the oauth2-session params and fills in defaults. Errors name the
+// offending parameter but never echo a secret value.
 func parseConfig(params map[string]interface{}) (*config, error) {
 	c := &config{}
+	if err := parseSessionParams(c, params); err != nil {
+		return nil, err
+	}
 	var err error
 
 	if c.authorizationEndpoint, err = requiredEndpoint(params, "authorizationEndpoint"); err != nil {
-		return nil, err
-	}
-	if c.tokenEndpoint, err = requiredEndpoint(params, "tokenEndpoint"); err != nil {
-		return nil, err
-	}
-	if c.clientID, err = requiredString(params, "clientId"); err != nil {
-		return nil, err
-	}
-	if c.clientSecret, err = requiredString(params, "clientSecret"); err != nil {
 		return nil, err
 	}
 	if c.redirectURI, err = requiredEndpoint(params, "redirectUri"); err != nil {
 		return nil, err
 	}
 
-	c.clientAuthMethod = getNestedStringParam(params, "clientAuthMethod", ClientAuthMethodBasic)
-	if c.clientAuthMethod != ClientAuthMethodBasic && c.clientAuthMethod != ClientAuthMethodPost {
-		return nil, fmt.Errorf("'clientAuthMethod' must be one of %q, %q", ClientAuthMethodBasic, ClientAuthMethodPost)
-	}
 	c.scopes = getNestedStringListParam(params, "scopes")
 
 	c.authorizationRequestParams = getNestedStringMapParam(params, "authorizationRequestParams")
@@ -181,13 +186,26 @@ func parseConfig(params map[string]interface{}) (*config, error) {
 	c.loginPath = getNestedStringParam(params, "loginPath", defaultLoginPath)
 	c.callbackPath = getNestedStringParam(params, "callbackPath", defaultCallbackPath)
 	c.logoutPath = getNestedStringParam(params, "logoutPath", defaultLogoutPath)
-	for name, p := range map[string]string{"loginPath": c.loginPath, "callbackPath": c.callbackPath, "logoutPath": c.logoutPath} {
-		if !strings.HasPrefix(p, "/") {
-			return nil, fmt.Errorf("'%s' must start with '/'", name)
-		}
+	c.checkSessionPath = getNestedStringParam(params, "checkSessionPath", defaultCheckSessionPath)
+	c.userinfoPath = getNestedStringParam(params, "userinfoPath", defaultUserinfoPath)
+	c.refreshPath = getNestedStringParam(params, "refreshPath", defaultRefreshPath)
+	routes := []struct{ name, path string }{
+		{"loginPath", c.loginPath},
+		{"callbackPath", c.callbackPath},
+		{"logoutPath", c.logoutPath},
+		{"checkSessionPath", c.checkSessionPath},
+		{"userinfoPath", c.userinfoPath},
+		{"refreshPath", c.refreshPath},
 	}
-	if c.loginPath == c.callbackPath || c.loginPath == c.logoutPath || c.callbackPath == c.logoutPath {
-		return nil, fmt.Errorf("'loginPath', 'callbackPath' and 'logoutPath' must be different")
+	seen := make(map[string]string, len(routes))
+	for _, r := range routes {
+		if !strings.HasPrefix(r.path, "/") {
+			return nil, fmt.Errorf("'%s' must start with '/'", r.name)
+		}
+		if other, dup := seen[r.path]; dup {
+			return nil, fmt.Errorf("'%s' and '%s' must be different", other, r.name)
+		}
+		seen[r.path] = r.name
 	}
 	redirectURL, _ := url.Parse(c.redirectURI) // already validated by requiredEndpoint
 	if !strings.HasSuffix(redirectURL.Path, c.callbackPath) {
@@ -203,54 +221,27 @@ func parseConfig(params map[string]interface{}) (*config, error) {
 		return nil, fmt.Errorf("'postLogoutRedirect' must be a relative path starting with a single '/'")
 	}
 
-	c.cookieName = getNestedStringParam(params, "cookie.name", defaultCookieName)
-	c.stateCookieName = getNestedStringParam(params, "cookie.stateCookieName", defaultStateCookieName)
-	for name, v := range map[string]string{"cookie.name": c.cookieName, "cookie.stateCookieName": c.stateCookieName} {
-		if !cookieNamePattern.MatchString(v) {
-			return nil, fmt.Errorf("'%s' is not a valid cookie name", name)
-		}
-	}
-	if c.cookieName == c.stateCookieName {
-		return nil, fmt.Errorf("'cookie.name' and 'cookie.stateCookieName' must be different")
-	}
-	c.cookieSameSite = getNestedStringParam(params, "cookie.sameSite", SameSiteLax)
-	if c.cookieSameSite != SameSiteLax && c.cookieSameSite != SameSiteStrict {
-		return nil, fmt.Errorf("'cookie.sameSite' must be one of %q, %q", SameSiteLax, SameSiteStrict)
-	}
-	c.cookieSecure = getNestedBoolParam(params, "cookie.secure", true)
-	if !c.cookieSecure {
-		if strings.HasPrefix(c.cookieName, "__Host-") || strings.HasPrefix(c.cookieName, "__Secure-") ||
-			strings.HasPrefix(c.stateCookieName, "__Host-") || strings.HasPrefix(c.stateCookieName, "__Secure-") {
-			return nil, fmt.Errorf("cookie names with the __Host- or __Secure- prefix require 'cookie.secure' to be true")
-		}
-		slog.Warn("OAuth2Session: cookie.secure is disabled - session cookies will be sent over plain HTTP; never use this outside local testing")
-	}
-
-	signingSecret, err := requiredSecret(params, "sessionSigningKey")
-	if err != nil {
-		return nil, err
-	}
-	encryptionSecret, err := requiredSecret(params, "tokenEncryptionKey")
-	if err != nil {
-		return nil, err
-	}
-	// HKDF turns operator-supplied secrets of any length >= 32 bytes into fixed-size keys, with
-	// distinct labels so the two keys never coincide even if the same secret is used for both.
-	if c.signingKey, err = hkdf.Key(sha3.New256, []byte(signingSecret), nil, "oauth2-session cookie signing v1", 32); err != nil {
-		return nil, fmt.Errorf("deriving session signing key: %w", err)
-	}
-	if c.encryptionKey, err = hkdf.Key(sha3.New256, []byte(encryptionSecret), nil, "oauth2-session token encryption v1", 32); err != nil {
-		return nil, fmt.Errorf("deriving token encryption key: %w", err)
-	}
-
-	c.idleTimeout = getNestedPositiveDurationParam(params, "idleTimeout", defaultIdleTimeout)
-	c.absoluteSessionTimeout = getNestedPositiveDurationParam(params, "absoluteSessionTimeout", defaultAbsoluteSessionTimeout)
-	c.refreshBuffer = getNestedDurationParam(params, "refreshBuffer", defaultRefreshBuffer)
-	if c.refreshBuffer < 0 {
-		c.refreshBuffer = defaultRefreshBuffer
-	}
 	c.stateTTL = getNestedPositiveDurationParam(params, "stateTTL", defaultStateTTL)
-	c.defaultTokenTTL = getNestedPositiveDurationParam(params, "defaultTokenTTL", defaultTokenTTL)
+	c.refreshCooldown = getNestedDurationParam(params, "refreshCooldown", defaultRefreshCooldown)
+	if c.refreshCooldown < 0 {
+		c.refreshCooldown = defaultRefreshCooldown
+	}
+	return c, nil
+}
+
+// parseProxyConfig validates the oauth2-session-proxy params: the session, cookie and token
+// endpoint settings it shares with oauth2-session, plus how the token is sent upstream.
+func parseProxyConfig(params map[string]interface{}) (*config, error) {
+	c := &config{}
+	if err := parseSessionParams(c, params); err != nil {
+		return nil, err
+	}
+	c.refreshOnUpstreamUnauthorized = getNestedBoolParam(params, "refreshOnUpstreamUnauthorized", true)
+	c.continueWithoutCookie = getNestedBoolParam(params, "continueWithoutCookie", false)
+	c.upstreamUnauthorizedCooldown = getNestedDurationParam(params, "upstreamUnauthorizedCooldown", defaultUpstreamUnauthorizedCooldown)
+	if c.upstreamUnauthorizedCooldown < 0 {
+		c.upstreamUnauthorizedCooldown = defaultUpstreamUnauthorizedCooldown
+	}
 
 	c.upstreamHeaderName = getNestedStringParam(params, "upstreamHeaderName", defaultUpstreamHeaderName)
 	c.upstreamValuePrefix = defaultUpstreamValuePrefix
@@ -261,6 +252,75 @@ func parseConfig(params map[string]interface{}) (*config, error) {
 		}
 	}
 
+	return c, nil
+}
+
+// parseSessionParams reads the settings every policy that reads a session must share with the
+// policy that created it: the client used to refresh tokens, the cookie, the keys, the session
+// lifetimes and Redis. A difference in the cookie or keys makes every session look invalid.
+func parseSessionParams(c *config, params map[string]interface{}) error {
+	var err error
+
+	if c.tokenEndpoint, err = requiredEndpoint(params, "tokenEndpoint"); err != nil {
+		return err
+	}
+	if c.clientID, err = requiredString(params, "clientId"); err != nil {
+		return err
+	}
+	if c.clientSecret, err = requiredString(params, "clientSecret"); err != nil {
+		return err
+	}
+	c.clientAuthMethod = getNestedStringParam(params, "clientAuthMethod", ClientAuthMethodBasic)
+	if c.clientAuthMethod != ClientAuthMethodBasic && c.clientAuthMethod != ClientAuthMethodPost {
+		return fmt.Errorf("'clientAuthMethod' must be one of %q, %q", ClientAuthMethodBasic, ClientAuthMethodPost)
+	}
+	c.cookieName = getNestedStringParam(params, "cookie.name", defaultCookieName)
+	c.stateCookieName = getNestedStringParam(params, "cookie.stateCookieName", defaultStateCookieName)
+	for name, v := range map[string]string{"cookie.name": c.cookieName, "cookie.stateCookieName": c.stateCookieName} {
+		if !cookieNamePattern.MatchString(v) {
+			return fmt.Errorf("'%s' is not a valid cookie name", name)
+		}
+	}
+	if c.cookieName == c.stateCookieName {
+		return fmt.Errorf("'cookie.name' and 'cookie.stateCookieName' must be different")
+	}
+	c.cookieSameSite = getNestedStringParam(params, "cookie.sameSite", SameSiteLax)
+	if c.cookieSameSite != SameSiteLax && c.cookieSameSite != SameSiteStrict {
+		return fmt.Errorf("'cookie.sameSite' must be one of %q, %q", SameSiteLax, SameSiteStrict)
+	}
+	c.cookieSecure = getNestedBoolParam(params, "cookie.secure", true)
+	if !c.cookieSecure {
+		if strings.HasPrefix(c.cookieName, "__Host-") || strings.HasPrefix(c.cookieName, "__Secure-") ||
+			strings.HasPrefix(c.stateCookieName, "__Host-") || strings.HasPrefix(c.stateCookieName, "__Secure-") {
+			return fmt.Errorf("cookie names with the __Host- or __Secure- prefix require 'cookie.secure' to be true")
+		}
+		slog.Warn("OAuth2Session: cookie.secure is disabled - session cookies will be sent over plain HTTP; never use this outside local testing")
+	}
+
+	signingSecret, err := requiredSecret(params, "sessionSigningKey")
+	if err != nil {
+		return err
+	}
+	encryptionSecret, err := requiredSecret(params, "tokenEncryptionKey")
+	if err != nil {
+		return err
+	}
+	// HKDF turns operator-supplied secrets of any length >= 32 bytes into fixed-size keys, with
+	// distinct labels so the two keys never coincide even if the same secret is used for both.
+	if c.signingKey, err = hkdf.Key(sha3.New256, []byte(signingSecret), nil, "oauth2-session cookie signing v1", 32); err != nil {
+		return fmt.Errorf("deriving session signing key: %w", err)
+	}
+	if c.encryptionKey, err = hkdf.Key(sha3.New256, []byte(encryptionSecret), nil, "oauth2-session token encryption v1", 32); err != nil {
+		return fmt.Errorf("deriving token encryption key: %w", err)
+	}
+
+	c.idleTimeout = getNestedPositiveDurationParam(params, "idleTimeout", defaultIdleTimeout)
+	c.absoluteSessionTimeout = getNestedPositiveDurationParam(params, "absoluteSessionTimeout", defaultAbsoluteSessionTimeout)
+	c.refreshBuffer = getNestedDurationParam(params, "refreshBuffer", defaultRefreshBuffer)
+	if c.refreshBuffer < 0 {
+		c.refreshBuffer = defaultRefreshBuffer
+	}
+	c.defaultTokenTTL = getNestedPositiveDurationParam(params, "defaultTokenTTL", defaultTokenTTL)
 	c.tokenRequestTimeout = getNestedPositiveDurationParam(params, "tokenRequestTimeout", defaultTokenRequestTimeout)
 	c.tokenRequestMaxRetries = getNestedIntParam(params, "tokenRequestMaxRetries", defaultTokenRequestMaxRetries)
 	if c.tokenRequestMaxRetries < 0 {
@@ -286,7 +346,7 @@ func parseConfig(params map[string]interface{}) (*config, error) {
 		poolSize:          getNestedIntParam(params, "redis.poolSize", 0),
 	}
 
-	return c, nil
+	return nil
 }
 
 // requiredString returns a non-empty, trimmed string parameter.

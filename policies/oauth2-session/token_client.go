@@ -54,6 +54,7 @@ type tokenResponse struct {
 	TokenType    string
 	RefreshToken string
 	IDToken      string
+	DeviceSecret string // OpenID Connect Native SSO; returned when the device_sso scope was granted
 	Scopes       []string
 	Expiry       time.Time
 }
@@ -87,6 +88,7 @@ type tokenJSON struct {
 	TokenType    string          `json:"token_type"`
 	RefreshToken string          `json:"refresh_token"`
 	IDToken      string          `json:"id_token"`
+	DeviceSecret string          `json:"device_secret"`
 	Scope        string          `json:"scope"`
 	ExpiresIn    json.RawMessage `json:"expires_in"`
 }
@@ -238,6 +240,7 @@ func (c *tokenClient) do(ctx context.Context, form url.Values) (*tokenResponse, 
 		TokenType:    parsed.TokenType,
 		RefreshToken: parsed.RefreshToken,
 		IDToken:      parsed.IDToken,
+		DeviceSecret: parsed.DeviceSecret,
 		Scopes:       strings.Fields(parsed.Scope),
 		Expiry:       c.now().Add(c.defaultTTL),
 	}

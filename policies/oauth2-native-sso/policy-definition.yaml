@@ -1,0 +1,350 @@
+name: oauth2-native-sso
+version: v0.1.0
+displayName: OAuth2 Native SSO
+description: |
+  Signs a browser in to this API from the oauth2-session login it already
+  has on another API on the same gateway host, without a round trip to the
+  identity provider. The other API's session (the source) is read from
+  Redis; its id_token and device_secret are exchanged at the token endpoint
+  with the OpenID Connect Native SSO for Mobile Apps 1.0 token exchange for
+  this API's client tokens, which are stored as a new oauth2-session session
+  (the target). The browser receives the target session cookie in a
+  redirect, and this API's own oauth2-session policy serves the session from
+  then on. Attach it at API level before this API's oauth2-session policy.
+  When SSO isn't possible, requests continue unchanged and oauth2-session
+  runs its normal login.
+
+parameters:
+  type: object
+  additionalProperties: false
+  required:
+    - tokenEndpoint
+    - clientId
+    - clientSecret
+    - source
+    - target
+  properties:
+    tokenEndpoint:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Identity provider token endpoint that performs the Native SSO token
+        exchange. Must use https:// unless allowInsecureTokenEndpoint is set.
+    clientId:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        OAuth2 client ID of this API; the same clientId as this API's
+        oauth2-session policy.
+    clientSecret:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: Client secret paired with clientId. Use {{ secret "handle" }}.
+    clientAuthMethod:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: How client credentials are sent to the token endpoint.
+      enum:
+        - client_secret_basic
+        - client_secret_post
+      default: client_secret_basic
+    scopes:
+      type: array
+      x-wso2-policy-advanced-param: false
+      items:
+        type: string
+        minLength: 1
+      description: Scopes requested in the token exchange.
+      default: ["openid"]
+    issuer:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        Identity provider issuer identifier. When set, the exchange must
+        return an id_token from this issuer, issued to clientId and for the
+        same identity provider session (sid) as the source session, and the
+        new session is indexed so oauth2-session-backchannel-logout can end
+        it. Also the default audience. Use the issuer value of this API's
+        oauth2-session policy.
+      default: ""
+    audience:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        audience sent in the token exchange. Native SSO requires the issuer
+        of the identity provider; defaults to issuer. Required when issuer
+        is not set.
+      default: ""
+    resource:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        RFC 8707 resource indicator sent in the token exchange, asking for an
+        access token for that API (an absolute URI, e.g.
+        https://api.example.com/). Set it to the resource the target API's
+        own login requests. Not sent when empty.
+      default: ""
+    subjectToken:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Source session token sent as subject_token. Native SSO 1.0 uses the
+        id_token; some identity providers (such as ThunderID) take the
+        device_secret as the subject. Defaults to id_token.
+      enum: ["id_token", "device_secret"]
+    subjectTokenType:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        subject_token_type, an absolute URI. Defaults to
+        urn:ietf:params:oauth:token-type:id_token for the id_token and
+        urn:openid:params:token-type:device-secret for the device_secret.
+    actorToken:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Source session token sent as actor_token, or "none" to send no
+        actor_token. Defaults to the source token that isn't the subject.
+        One of subjectToken and actorToken must be device_secret.
+      enum: ["id_token", "device_secret", "none"]
+    actorTokenType:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        actor_token_type, an absolute URI. Defaults to
+        urn:openid:params:token-type:device-secret for the device_secret
+        and urn:ietf:params:oauth:token-type:id_token for the id_token. Not
+        allowed when actorToken is "none".
+    loginPath:
+      type: string
+      x-wso2-policy-advanced-param: false
+      pattern: "^/"
+      description: |
+        Operation path of this API's oauth2-session login. A GET to it with
+        a usable source session is answered with a 302 to returnTo (a
+        relative path) or postLoginRedirect, carrying the new session cookie.
+      default: "/login"
+    postLoginRedirect:
+      type: string
+      x-wso2-policy-advanced-param: false
+      pattern: "^/"
+      description: |
+        Path from the host root where users land after SSO when no valid
+        returnTo is given. Include the API context.
+      default: "/"
+    transparentSso:
+      type: boolean
+      x-wso2-policy-advanced-param: false
+      description: |
+        When true, a request to any other operation that carries no target
+        session cookie but a usable source session is also signed in: it is
+        answered with a 307 back to the same path (method and body kept)
+        carrying the new session cookie. When false, only loginPath signs in.
+      default: false
+    source:
+      type: object
+      x-wso2-policy-advanced-param: false
+      additionalProperties: false
+      description: |
+        The oauth2-session attachment of the API the user is already signed
+        in to. Its session record must hold the device_secret in a
+        "device_secret" member (the login must request the device_sso scope).
+      required:
+        - cookieName
+        - sessionSigningKey
+        - tokenEncryptionKey
+      properties:
+        cookieName:
+          type: string
+          minLength: 1
+          description: Session cookie name of the source oauth2-session policy.
+        sessionSigningKey:
+          type: string
+          minLength: 32
+          description: |
+            sessionSigningKey of the source oauth2-session policy. Use
+            {{ secret "handle" }}.
+        tokenEncryptionKey:
+          type: string
+          minLength: 32
+          description: |
+            tokenEncryptionKey of the source oauth2-session policy. Use
+            {{ secret "handle" }}.
+        absoluteSessionTimeout:
+          type: string
+          description: |
+            absoluteSessionTimeout of the source oauth2-session policy (Go
+            duration). An older source session is not used, and the new
+            session never outlives the source session.
+          default: "8h"
+    target:
+      type: object
+      x-wso2-policy-advanced-param: false
+      additionalProperties: false
+      description: |
+        This API's oauth2-session attachment. Every value must equal the
+        corresponding oauth2-session parameter, or that policy won't accept
+        the session this policy creates.
+      required:
+        - cookieName
+        - sessionSigningKey
+        - tokenEncryptionKey
+      properties:
+        cookieName:
+          type: string
+          minLength: 1
+          description: |
+            Session cookie name (cookie.name) of this API's oauth2-session
+            policy. Must differ from source.cookieName.
+        sessionSigningKey:
+          type: string
+          minLength: 32
+          description: sessionSigningKey of this API's oauth2-session policy.
+        tokenEncryptionKey:
+          type: string
+          minLength: 32
+          description: tokenEncryptionKey of this API's oauth2-session policy.
+        idleTimeout:
+          type: string
+          description: idleTimeout of this API's oauth2-session policy.
+          default: "30m"
+        absoluteSessionTimeout:
+          type: string
+          description: absoluteSessionTimeout of this API's oauth2-session policy.
+          default: "8h"
+        sameSite:
+          type: string
+          description: cookie.sameSite of this API's oauth2-session policy.
+          enum: ["Lax", "Strict"]
+          default: "Lax"
+        secure:
+          type: boolean
+          description: cookie.secure of this API's oauth2-session policy.
+          default: true
+    defaultTokenTTL:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Access token lifetime assumed when the exchange response omits
+        expires_in (Go duration, e.g. "1h").
+      default: "1h"
+    tokenRequestTimeout:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: Timeout for a token endpoint call (Go duration, e.g. "10s").
+      default: "10s"
+    tokenRequestMaxRetries:
+      type: integer
+      x-wso2-policy-advanced-param: true
+      minimum: 0
+      description: |
+        Retries after a 429 or 5xx from the token endpoint. Network errors
+        are not retried.
+      default: 2
+    allowInsecureTokenEndpoint:
+      type: boolean
+      x-wso2-policy-advanced-param: true
+      description: |
+        Allows an http:// tokenEndpoint. Local testing only.
+      default: false
+    proxyURL:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Proxy URL for token endpoint calls. Defaults to the standard
+        HTTP_PROXY/HTTPS_PROXY environment variables.
+      default: ""
+    tlsCaCert:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        PEM CA certificate to trust for the token endpoint's TLS
+        connection. Reference a stored secret, not a raw value.
+      default: ""
+    tlsInsecureSkipVerify:
+      type: boolean
+      x-wso2-policy-advanced-param: true
+      description: |
+        Disables TLS certificate verification for the token endpoint.
+        Non-production only.
+      default: false
+
+systemParameters:
+  type: object
+  additionalProperties: false
+  description: >
+    Operator-level Redis settings. They default to the oauth2-session
+    section, config.policy_configurations.oauth2_session_v0.redis.*, so
+    both policies use the same Redis, database and key prefix.
+  properties:
+    redis:
+      type: object
+      additionalProperties: false
+      properties:
+        host:
+          type: string
+          description: Redis host name or IP address.
+          default: "localhost"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.host}"
+
+        port:
+          type: integer
+          description: Redis server port.
+          minimum: 1
+          maximum: 65535
+          default: 6379
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.port}"
+
+        password:
+          type: string
+          description: Optional Redis authentication password.
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.password}"
+
+        username:
+          type: string
+          description: Optional Redis ACL username.
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.username}"
+
+        db:
+          type: integer
+          description: Redis database index.
+          minimum: 0
+          maximum: 15
+          default: 0
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.db}"
+
+        keyPrefix:
+          type: string
+          description: Key prefix; must equal the one oauth2-session uses.
+          default: "oauth2-session:v1:"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.key_prefix}"
+
+        connectionTimeout:
+          type: string
+          description: Redis connection timeout (Go duration, e.g. "5s").
+          default: "5s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.connection_timeout}"
+
+        readTimeout:
+          type: string
+          description: Redis read timeout (Go duration, e.g. "3s").
+          default: "3s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.read_timeout}"
+
+        writeTimeout:
+          type: string
+          description: Redis write timeout (Go duration, e.g. "3s").
+          default: "3s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.write_timeout}"
+
+        poolSize:
+          type: integer
+          description: |
+            Redis connection pool size. 0 = go-redis default (10 x
+            GOMAXPROCS).
+          minimum: 0
+          default: 0
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.pool_size}"

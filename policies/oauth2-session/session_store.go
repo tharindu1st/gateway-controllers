@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -39,16 +40,23 @@ type session struct {
 	TokenType    string   `json:"tt,omitempty"`
 	IDToken      string   `json:"it,omitempty"`
 	Scopes       []string `json:"sc,omitempty"`
-	ExpiresAt    int64    `json:"exp"` // access token expiry, unix seconds
-	CreatedAt    int64    `json:"cat"` // login time, unix seconds; anchors absoluteSessionTimeout
+	ExpiresAt    int64    `json:"exp"`           // access token expiry, unix seconds
+	CreatedAt    int64    `json:"cat"`           // login time, unix seconds; anchors absoluteSessionTimeout
+	ObtainedAt   int64    `json:"oat,omitempty"` // when the access token was issued to the gateway, unix seconds
+	// DeviceSecret is the OpenID Connect Native SSO device_secret, which oauth2-native-sso exchanges
+	// for another API's session. It never leaves the gateway. The member name is what that policy reads.
+	DeviceSecret string `json:"device_secret,omitempty"`
 }
 
-func (s *session) expiry() time.Time  { return time.Unix(s.ExpiresAt, 0) }
-func (s *session) created() time.Time { return time.Unix(s.CreatedAt, 0) }
+func (s *session) expiry() time.Time   { return time.Unix(s.ExpiresAt, 0) }
+func (s *session) created() time.Time  { return time.Unix(s.CreatedAt, 0) }
+func (s *session) obtained() time.Time { return time.Unix(s.ObtainedAt, 0) }
 
-// releaseLockScript deletes the lock only if it still holds this caller's token, so a refresh
-// that outlived its lock TTL can't release a lock another replica has since taken.
-var releaseLockScript = redis.NewScript(`
+// deleteIfEqualScript deletes a key only while it still holds the given value. It releases a
+// refresh lock only if it still holds this caller's token, so a refresh that outlived its lock TTL
+// can't release a lock another replica has since taken; and it discards an undecryptable session
+// record without touching one rewritten meanwhile.
+var deleteIfEqualScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   return redis.call("DEL", KEYS[1])
 end
@@ -105,7 +113,7 @@ func (s *sessionStore) loadSession(ctx context.Context, sid string, idleTimeout 
 	if err != nil {
 		return nil, fmt.Errorf("reading session: %w", err)
 	}
-	return s.decryptSession(key, raw)
+	return s.openOrDiscard(ctx, key, raw)
 }
 
 // getSession reads a session without touching its TTL; used to re-read after another replica's refresh.
@@ -120,7 +128,23 @@ func (s *sessionStore) getSession(ctx context.Context, sid string) (*session, er
 	if err != nil {
 		return nil, fmt.Errorf("reading session: %w", err)
 	}
-	return s.decryptSession(key, raw)
+	return s.openOrDiscard(ctx, key, raw)
+}
+
+// openOrDiscard decrypts a session record. A record that can't be decrypted - written under a
+// tokenEncryptionKey that has since been changed, or corrupted - can never be used again, so it is
+// deleted and reported as no session: the user signs in again instead of getting 503 until it expires.
+func (s *sessionStore) openOrDiscard(ctx context.Context, key string, raw []byte) (*session, error) {
+	sess, err := s.decryptSession(key, raw)
+	if err == nil {
+		return sess, nil
+	}
+	slog.Warn("OAuth2Session: discarding a session record that could not be decrypted (was tokenEncryptionKey changed?)", "error", err)
+	// Only this exact record is removed, so a record rewritten meanwhile is never touched.
+	if delErr := deleteIfEqualScript.Run(context.WithoutCancel(ctx), s.client, []string{key}, raw).Err(); delErr != nil && !errors.Is(delErr, redis.Nil) {
+		slog.Debug("OAuth2Session: removing the undecryptable record failed; it expires on its own", "error", delErr)
+	}
+	return nil, nil
 }
 
 // idpIndexKey is the key of the set that lists the gateway sessions belonging to one identity
@@ -187,6 +211,97 @@ func (s *sessionStore) sealSession(key string, sess *session) ([]byte, error) {
 		return nil, fmt.Errorf("generating nonce: %w", err)
 	}
 	return s.aead.Seal(nonce, nonce, plain, []byte(key)), nil
+}
+
+// expireAccessToken marks the access token of the session stored under key as expired, so the
+// next request refreshes it. It runs as an optimistic transaction (WATCH) and only changes the
+// record while it still holds the token with hash tokenHash: a token another request has already
+// refreshed is never touched, and the record's TTL is kept. ok is false when nothing was changed.
+func (s *sessionStore) expireAccessToken(ctx context.Context, key, tokenHash string) (ok bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, s.readTimeout+s.writeTimeout)
+	defer cancel()
+	err = s.client.Watch(ctx, func(tx *redis.Tx) error {
+		raw, err := tx.Get(ctx, key).Bytes()
+		if errors.Is(err, redis.Nil) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		sess, err := s.decryptSession(key, raw)
+		if err != nil {
+			return err
+		}
+		if hashID(sess.AccessToken) != tokenHash || sess.ExpiresAt == 0 {
+			return nil
+		}
+		sess.ExpiresAt = 0
+		sealed, err := s.sealSession(key, sess)
+		if err != nil {
+			return err
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.SetArgs(ctx, key, sealed, redis.SetArgs{Mode: "XX", KeepTTL: true})
+			return nil
+		})
+		if err == nil {
+			ok = true
+		}
+		return err
+	}, key)
+	if errors.Is(err, redis.TxFailedErr) {
+		return false, nil // the record changed meanwhile, e.g. a refresh stored a new token
+	}
+	if err != nil {
+		return false, fmt.Errorf("expiring access token: %w", err)
+	}
+	return ok, nil
+}
+
+// takeSession reads and deletes a session in one MULTI/EXEC transaction (GETDEL), together with
+// its refresh lock. It returns (nil, nil) when there was no session. A record that can no longer
+// be decrypted is still deleted and reported as no session.
+func (s *sessionStore) takeSession(ctx context.Context, sid string) (*session, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.writeTimeout)
+	defer cancel()
+	key := s.sessionKey(sid)
+	pipe := s.client.TxPipeline()
+	get := pipe.GetDel(ctx, key)
+	pipe.Del(ctx, s.lockKey(sid))
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("deleting session: %w", err)
+	}
+	raw, err := get.Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("deleting session: %w", err)
+	}
+	sess, err := s.decryptSession(key, raw)
+	if err != nil {
+		slog.Warn("OAuth2Session: deleted a session record that could not be decrypted", "error", err)
+		return nil, nil
+	}
+	return sess, nil
+}
+
+// removeFromIndexes removes sid from the given back-channel index sets.
+func (s *sessionStore) removeFromIndexes(ctx context.Context, sid string, indexKeys []string) error {
+	if len(indexKeys) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.writeTimeout)
+	defer cancel()
+	member := hashID(sid)
+	pipe := s.client.Pipeline()
+	for _, ik := range indexKeys {
+		pipe.SRem(ctx, ik, member)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("updating back-channel index: %w", err)
+	}
+	return nil
 }
 
 func (s *sessionStore) deleteSession(ctx context.Context, sid string) error {
@@ -259,7 +374,7 @@ func (s *sessionStore) acquireRefreshLock(ctx context.Context, sid string, ttl t
 func (s *sessionStore) releaseRefreshLock(ctx context.Context, sid, token string) error {
 	ctx, cancel := context.WithTimeout(ctx, s.writeTimeout)
 	defer cancel()
-	if err := releaseLockScript.Run(ctx, s.client, []string{s.lockKey(sid)}, token).Err(); err != nil && !errors.Is(err, redis.Nil) {
+	if err := deleteIfEqualScript.Run(ctx, s.client, []string{s.lockKey(sid)}, token).Err(); err != nil && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("releasing refresh lock: %w", err)
 	}
 	return nil

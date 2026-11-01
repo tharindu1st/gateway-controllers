@@ -1,0 +1,275 @@
+name: oauth2-session-proxy
+version: v0.1.0
+displayName: OAuth2 Session Proxy
+description: |
+  Turns the session cookie set by oauth2-session into a bearer token on
+  the request sent to the backend. The session's access token is read
+  from Redis, refreshed before it expires, and set in the Authorization
+  header; the session cookies are removed from the upstream request.
+  Attach it to the backend operations, including wildcard proxy routes,
+  and configure the same client, cookie and keys as oauth2-session.
+  Requests without a valid session get 401.
+
+parameters:
+  type: object
+  additionalProperties: false
+  required:
+    - tokenEndpoint
+    - clientId
+    - clientSecret
+    - sessionSigningKey
+    - tokenEncryptionKey
+  properties:
+    tokenEndpoint:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Identity provider token endpoint used to refresh access tokens.
+        Same as in oauth2-session.
+    clientId:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: OAuth2 client ID. Same as in oauth2-session.
+    clientSecret:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 1
+      description: |
+        Client secret paired with clientId. Same as in oauth2-session. Use {{ secret "handle" }}.
+    clientAuthMethod:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: How client credentials are sent to the token endpoint.
+      enum:
+        - client_secret_basic
+        - client_secret_post
+      default: client_secret_basic
+    sessionSigningKey:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 32
+      description: |
+        Secret used to sign session cookies (HMAC-SHA3-256), at least
+        32 bytes. Use {{ secret "handle" }}. Must be the same secret as
+        in oauth2-session.
+    tokenEncryptionKey:
+      type: string
+      x-wso2-policy-advanced-param: false
+      minLength: 32
+      description: |
+        Secret used to encrypt tokens in Redis (AES-256-GCM), at least
+        32 bytes. Use {{ secret "handle" }}. Must be the same secret as
+        in oauth2-session.
+    idleTimeout:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        A session not used for this long ends (Go duration, e.g. "30m").
+        Use the same value as in oauth2-session.
+      default: "30m"
+    absoluteSessionTimeout:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        Maximum age of a session regardless of activity (Go duration,
+        e.g. "8h"). Also the lifetime of the session
+        cookie. Use the same value as in oauth2-session.
+      default: "8h"
+    continueWithoutCookie:
+      type: boolean
+      x-wso2-policy-advanced-param: false
+      description: |
+        When true, a request that carries no session cookie is not
+        rejected: it continues unchanged to the next
+        policies (for example a JWT or API key policy for non-browser
+        clients), which must then authenticate it. A request that carries
+        the cookie is still authenticated by this policy and rejected with
+        401 if its session isn't valid.
+      default: false
+    upstreamHeaderName:
+      type: string
+      x-wso2-policy-advanced-param: true
+      minLength: 1
+      description: Header on the backend request that carries the access token.
+      default: "Authorization"
+    upstreamValuePrefix:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Prefix placed before the access token. Use an empty string for
+        no prefix.
+      default: "Bearer"
+    refreshOnUpstreamUnauthorized:
+      type: boolean
+      x-wso2-policy-advanced-param: true
+      description: |
+        When the backend answers 401, mark the session's access token as
+        expired so the next request refreshes it with the refresh token. The
+        401 itself is still returned to the client.
+      default: true
+    upstreamUnauthorizedCooldown:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        A backend 401 is ignored for an access token obtained less than this
+        long ago, so a backend that rejects every token can't make each
+        request refresh (Go duration, e.g. "30s").
+      default: "30s"
+    cookie:
+      type: object
+      x-wso2-policy-advanced-param: true
+      additionalProperties: false
+      description: Session cookie settings. Must match oauth2-session.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: |
+            Session cookie name. The __Host- prefix (e.g. __Host-X-ABC) is
+            recommended: it stops other subdomains from setting the cookie.
+          default: "X-ABC"
+        stateCookieName:
+          type: string
+          minLength: 1
+          description: Short-lived cookie that ties a login to the browser.
+          default: "X-ABC-state"
+        sameSite:
+          type: string
+          description: SameSite attribute of the session cookie.
+          enum: ["Lax", "Strict"]
+          default: "Lax"
+        secure:
+          type: boolean
+          description: |
+            Secure attribute. Disable only for local testing over plain
+            HTTP.
+          default: true
+    refreshBuffer:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        How long before expiry the access token is refreshed (Go
+        duration, e.g. "5m").
+      default: "5m"
+    defaultTokenTTL:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Access token lifetime assumed when the token response omits
+        expires_in (Go duration, e.g. "1h").
+      default: "1h"
+    tokenRequestTimeout:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: Timeout for a token endpoint call (Go duration, e.g. "10s").
+      default: "10s"
+    tokenRequestMaxRetries:
+      type: integer
+      x-wso2-policy-advanced-param: true
+      minimum: 0
+      description: |
+        Retries after a 429 or 5xx from the token endpoint. Network
+        errors are not retried, because the code or refresh token may
+        already have been used.
+      default: 2
+    proxyURL:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        Proxy URL for token endpoint calls. Defaults to the standard
+        HTTP_PROXY/HTTPS_PROXY environment variables.
+      default: ""
+    tlsCaCert:
+      type: string
+      x-wso2-policy-advanced-param: true
+      description: |
+        PEM CA certificate to trust for the token endpoint's TLS
+        connection. Reference a stored secret, not a raw value.
+      default: ""
+    tlsInsecureSkipVerify:
+      type: boolean
+      x-wso2-policy-advanced-param: true
+      description: |
+        Disables TLS certificate verification for the token endpoint.
+        Non-production only.
+      default: false
+
+systemParameters:
+  type: object
+  additionalProperties: false
+  description: >
+    Operator-level Redis settings, not set per API. Resolved from
+    config.policy_configurations.oauth2_session_v0.redis.* unless
+    overridden here. Redis is required: if it is unreachable, requests
+    fail closed.
+  properties:
+    redis:
+      type: object
+      additionalProperties: false
+      properties:
+        host:
+          type: string
+          description: Redis host name or IP address.
+          default: "localhost"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.host}"
+
+        port:
+          type: integer
+          description: Redis server port.
+          minimum: 1
+          maximum: 65535
+          default: 6379
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.port}"
+
+        password:
+          type: string
+          description: Optional Redis authentication password.
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.password}"
+
+        username:
+          type: string
+          description: Optional Redis ACL username.
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.username}"
+
+        db:
+          type: integer
+          description: Redis database index.
+          minimum: 0
+          maximum: 15
+          default: 0
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.db}"
+
+        keyPrefix:
+          type: string
+          description: Prefix used for all Redis keys this policy writes.
+          default: "oauth2-session:v1:"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.key_prefix}"
+
+        connectionTimeout:
+          type: string
+          description: Redis connection timeout (Go duration, e.g. "5s").
+          default: "5s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.connection_timeout}"
+
+        readTimeout:
+          type: string
+          description: Redis read timeout (Go duration, e.g. "3s").
+          default: "3s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.read_timeout}"
+
+        writeTimeout:
+          type: string
+          description: Redis write timeout (Go duration, e.g. "3s").
+          default: "3s"
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.write_timeout}"
+
+        poolSize:
+          type: integer
+          description: |
+            Redis connection pool size. 0 = go-redis default (10 x
+            GOMAXPROCS).
+          minimum: 0
+          default: 0
+          "wso2/defaultValue": "${config.policy_configurations.oauth2_session_v0.redis.pool_size}"
