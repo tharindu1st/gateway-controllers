@@ -78,7 +78,7 @@ and **system parameters**, set by the gateway operator in `config.toml`.
 | `callbackPath` | string | No | `"/callback"` | Operation path the identity provider redirects back to. Must match a declared `GET` operation. |
 | `logoutPath` | string | No | `"/logout"` | Operation path that ends the session. `GET` answers with a `302`; `POST` (the ThunderID SDK backend-mode signOut) answers `200 {"redirectUrl": ...}`. Declare it as a `GET` and/or `POST` operation. |
 | `checkSessionPath` | string | No | `"/checksession"` | Operation path of the checkSession endpoint for the ThunderID SDK backend mode. Same payload as `userinfoPath`, but doesn't extend the idle timeout or refresh. Declare it as a `GET` operation to use it. See [Check Session](#check-session-get-checksessionpath). |
-| `userinfoPath` | string | No | `"/userinfo"` | Operation path of the session endpoint for the ThunderID SDK backend mode: `{"isSignedIn", "user", "expiresAt"}`, with the user claims from the cached `id_token`. Declare it as a `GET` operation to use it. See [User Info](#user-info-get-userinfopath). |
+| `userinfoPath` | string | No | `"/userinfo"` | Operation path of the session endpoint for the ThunderID SDK backend mode: `{"isSignedIn", "user", "expiresAt", "scope"}`, with the user claims from the cached `id_token` and the access token's granted scopes. Declare it as a `GET` operation to use it. See [User Info](#user-info-get-userinfopath). |
 | `refreshPath` | string | No | `"/refresh"` | Operation path of the refresh endpoint for the ThunderID SDK backend mode: `POST` refreshes the access token and answers `204`. Declare it as a `POST` operation to use it. See [Refresh on Request](#refresh-on-request-post-refreshpath). |
 | `postLoginRedirect` | string | No | `"/"` | Path from the host root where users land after login when no valid `returnTo` is given. Include the API context, e.g. `/orders/v1/`. |
 | `postLogoutRedirect` | string | No | `"/"` | Path from the host root where users land after logout. |
@@ -240,7 +240,7 @@ session, the gateway session is not ended by this policy alone. Two options:
 The checkSession endpoint of the ThunderID SDK's backend mode, which the SDK
 polls (`session.checkInterval`). It returns the same `200` payload as
 [User Info](#user-info-get-userinfopath): `{"isSignedIn": true, "user":
-{...}, "expiresAt": ...}` with a live session, otherwise
+{...}, "expiresAt": ..., "scope": "..."}` with a live session, otherwise
 `{"isSignedIn": false}`.
 
 With `{"isSignedIn": false}`, a session cookie the request carried is expired
@@ -267,7 +267,8 @@ can show who is signed in without receiving any token. Both answers are
 {
   "isSignedIn": true,
   "user": { "sub": "user-1", "name": "User One", "email": "user1@example.com" },
-  "expiresAt": 1800003600
+  "expiresAt": 1800003600,
+  "scope": "openid profile email orders:read"
 }
 ```
 
@@ -281,6 +282,14 @@ can show who is signed in without receiving any token. Both answers are
   `amr` are removed.
 - `expiresAt` is when the current access token expires (Unix seconds). It
   moves forward after each refresh.
+- `scope` is the scopes granted to the current access token, space-separated
+  as in a token response, so the app can hide what the user can't do. The
+  ThunderID SDK's backend mode reads it for `useGrantedPermissions()`. It is
+  the token response's `scope`, or the configured `scopes` when the response
+  omits it (the identity provider then granted exactly those), and it
+  follows a refresh that reports different scopes. It is left out when
+  neither gives any. Hiding something in the app is not access control: the
+  backend still checks the access token.
 - Without a session, for any reason (no cookie, forged cookie, logged out,
   expired, refresh token rejected), the answer is the same
   `{"isSignedIn": false}`, so it reveals nothing about why. A session cookie

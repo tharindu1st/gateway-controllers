@@ -44,6 +44,7 @@ type fakeIdP struct {
 	refreshStatus atomic.Int32 // non-zero forces this status on refresh
 	rotateDevice  atomic.Bool  // refresh responses carry a new device_secret
 	mu            sync.Mutex
+	scope         string         // scope of the tokens issued; "" means "openid orders:read", "-" omits it
 	validRefresh  map[string]int // refresh token -> generation of the tokens it yields
 }
 
@@ -96,6 +97,7 @@ func (idp *fakeIdP) issue(w http.ResponseWriter, gen int, deviceSecret bool) {
 	rt := "rt-" + strconv.Itoa(gen)
 	idp.mu.Lock()
 	idp.validRefresh[rt] = gen
+	scope := idp.scope
 	idp.mu.Unlock()
 	resp := map[string]interface{}{
 		"access_token":  "at-" + strconv.Itoa(gen),
@@ -104,6 +106,13 @@ func (idp *fakeIdP) issue(w http.ResponseWriter, gen int, deviceSecret bool) {
 		"expires_in":    3600,
 		"scope":         "openid orders:read",
 		"id_token":      testIDToken(gen),
+	}
+	switch scope {
+	case "":
+	case "-":
+		delete(resp, "scope")
+	default:
+		resp["scope"] = scope
 	}
 	if deviceSecret {
 		resp["device_secret"] = "ds-" + strconv.Itoa(gen)
@@ -995,6 +1004,10 @@ func TestUserinfo_FromIDToken(t *testing.T) {
 	if body["isSignedIn"] != true || user["sub"] != "user-1" || user["gen"] != float64(1) {
 		t.Fatalf("body = %s", resp.Body)
 	}
+	// scope is the token response's, space-separated.
+	if body["scope"] != "openid orders:read" {
+		t.Fatalf("scope = %v", body["scope"])
+	}
 	// expiresAt is the access token's expiry: login + expires_in (3600s).
 	if body["expiresAt"] != float64(h.clock.Add(-10*time.Minute).Add(time.Hour).Unix()) {
 		t.Fatalf("expiresAt = %v", body["expiresAt"])
@@ -1004,8 +1017,60 @@ func TestUserinfo_FromIDToken(t *testing.T) {
 			t.Errorf("protocol claim %q must not be returned", k)
 		}
 	}
-	if len(body) != 3 {
+	if len(body) != 4 {
 		t.Errorf("unexpected fields in %s", resp.Body)
+	}
+}
+
+// setIssuedScope makes the fake IdP issue tokens with scope ("-" omits it).
+func (h *harness) setIssuedScope(scope string) {
+	h.idp.mu.Lock()
+	h.idp.scope = scope
+	h.idp.mu.Unlock()
+}
+
+// A token response without scope granted exactly the requested scopes (RFC 6749 §5.1).
+func TestUserinfo_ScopeOmittedByIdP_ReportsRequestedScopes(t *testing.T) {
+	h := newHarness(t, map[string]interface{}{"scopes": []interface{}{"openid", "orders:read", "orders:write"}})
+	h.setIssuedScope("-")
+	cookie := h.login()
+
+	for _, op := range []string{"/userinfo", "/checksession"} {
+		body := jsonBody(t, immediate(t, first(h.call(op, "GET", "/orders/v1"+op, cookie))))
+		if body["scope"] != "openid orders:read orders:write" {
+			t.Fatalf("%s scope = %v, want the requested scopes", op, body["scope"])
+		}
+	}
+}
+
+func TestUserinfo_ScopeFollowsRefresh(t *testing.T) {
+	h := newHarness(t, nil)
+	cookie := h.login()
+
+	// A refresh that reports other scopes replaces them; one that omits scope keeps them (RFC 6749 §5.1).
+	h.setIssuedScope("openid")
+	h.clock = h.clock.Add(56 * time.Minute)
+	if body := jsonBody(t, immediate(t, first(h.call("/userinfo", "GET", "/orders/v1/userinfo", cookie)))); body["scope"] != "openid" {
+		t.Fatalf("scope after refresh = %v", body["scope"])
+	}
+	h.setIssuedScope("-")
+	h.clock = h.clock.Add(56 * time.Minute)
+	if body := jsonBody(t, immediate(t, first(h.call("/userinfo", "GET", "/orders/v1/userinfo", cookie)))); body["scope"] != "openid" {
+		t.Fatalf("scope after a refresh without scope = %v", body["scope"])
+	}
+	if calls := h.idp.refreshCalls.Load(); calls != 2 {
+		t.Fatalf("refresh calls = %d, want 2", calls)
+	}
+}
+
+func TestUserinfo_NoScopes_OmitsScope(t *testing.T) {
+	h := newHarness(t, map[string]interface{}{"scopes": []interface{}{}})
+	h.setIssuedScope("-")
+	cookie := h.login()
+
+	body := jsonBody(t, immediate(t, first(h.call("/userinfo", "GET", "/orders/v1/userinfo", cookie))))
+	if _, ok := body["scope"]; ok || body["isSignedIn"] != true {
+		t.Fatalf("body = %v, want no scope member", body)
 	}
 }
 

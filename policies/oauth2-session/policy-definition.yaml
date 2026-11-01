@@ -133,9 +133,10 @@ parameters:
       description: |
         Operation path of the ThunderID SDK backend-mode session endpoint:
         200 {"isSignedIn": true, "user": <claims of the cached id_token>,
-        "expiresAt": <access token expiry, unix seconds>}, or 200
-        {"isSignedIn": false} without a session. The identity provider is
-        not called. Declare it as a GET operation to use it.
+        "expiresAt": <access token expiry, unix seconds>, "scope":
+        <granted scopes, space-separated>}, or 200 {"isSignedIn": false}
+        without a session. The identity provider is not called. Declare it
+        as a GET operation to use it.
       default: "/userinfo"
     refreshPath:
       type: string

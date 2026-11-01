@@ -28,6 +28,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"hash"
 	"net/http"
 	"net/http/httptest"
@@ -124,6 +125,7 @@ type fakeIdP struct {
 	delay      time.Duration
 	idTokenSid string
 	rotateTo   string
+	omitScope  bool // the response has no scope member
 	mu         sync.Mutex
 	lastForm   url.Values
 }
@@ -165,6 +167,9 @@ func (idp *fakeIdP) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if idp.rotateTo != "" {
 		resp["device_secret"] = idp.rotateTo
+	}
+	if idp.omitScope {
+		delete(resp, "scope")
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -356,7 +361,8 @@ func TestLogin_SignsInWithNativeSSO(t *testing.T) {
 	}
 	rec := openRecord(t, targetEncryption, key, []byte(raw))
 	if rec["at"] != "billing-at" || rec["rt"] != "billing-rt" || rec["tt"] != "Bearer" ||
-		rec["it"] != idToken("billing-web", "idp-session-1") || rec["device_secret"] != "ds-2" {
+		rec["it"] != idToken("billing-web", "idp-session-1") || rec["device_secret"] != "ds-2" ||
+		fmt.Sprint(rec["sc"]) != "[openid billing:read]" {
 		t.Fatalf("target record = %v", rec)
 	}
 	if int64(rec["exp"].(float64)) != h.clock.Add(600*time.Second).Unix() || int64(rec["cat"].(float64)) != h.clock.Unix() ||
@@ -403,6 +409,20 @@ func TestLogin_NoRotation_KeepsSourceDeviceSecret(t *testing.T) {
 	raw, _ := h.mr.Get(sessKey(sid))
 	if rec := openRecord(t, targetEncryption, sessKey(sid), []byte(raw)); rec["device_secret"] != "ds-1" {
 		t.Fatalf("target device_secret = %v, want the source's", rec["device_secret"])
+	}
+}
+
+// A response without scope granted the requested scopes (RFC 8693 §2.2.1), so the target session
+// records those for oauth2-session's session endpoint.
+func TestLogin_NoScopeInResponse_RecordsRequestedScopes(t *testing.T) {
+	h := newHarness(t, map[string]interface{}{"scopes": []interface{}{"openid", "billing:read", "billing:write"}})
+	h.idp.omitScope = true
+	resp := immediate(t, h.call("/login", "GET", "/billing/v1/login", h.seedSource(nil)))
+	sid := targetSID(t, resp.Headers["set-cookie"])
+	raw, _ := h.mr.Get(sessKey(sid))
+	rec := openRecord(t, targetEncryption, sessKey(sid), []byte(raw))
+	if got := fmt.Sprint(rec["sc"]); got != "[openid billing:read billing:write]" {
+		t.Fatalf("target scopes = %s, want the requested ones", got)
 	}
 }
 

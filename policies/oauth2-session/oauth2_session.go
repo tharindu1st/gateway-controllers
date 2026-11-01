@@ -290,13 +290,18 @@ func (p *Policy) handleCallback(ctx context.Context, ds *policy.DownstreamReques
 		slog.Error("OAuth2Session: generating session id failed", "error", err)
 		return unavailable()
 	}
+	// A token response without scope granted exactly the requested scopes (RFC 6749 §5.1).
+	scopes := tok.Scopes
+	if len(scopes) == 0 {
+		scopes = p.cfg.scopes
+	}
 	now := p.now()
 	sess := &session{
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
 		TokenType:    tok.TokenType,
 		IDToken:      tok.IDToken,
-		Scopes:       tok.Scopes,
+		Scopes:       scopes,
 		ExpiresAt:    tok.Expiry.Unix(),
 		CreatedAt:    now.Unix(),
 		ObtainedAt:   now.Unix(),
@@ -431,7 +436,7 @@ func (p *Policy) endSessionURL(idToken string) string {
 }
 
 // handleCheckSession answers the checkSession endpoint of the ThunderID SDK's backend mode with
-// the same payload as userinfoPath: {"isSignedIn": true, "user": ..., "expiresAt": ...}, or
+// the same payload as userinfoPath: {"isSignedIn": true, "user": ..., "expiresAt": ..., "scope": ...}, or
 // {"isSignedIn": false} with the session cookie expired. Unlike userinfoPath it neither slides the idle timeout nor refreshes, so
 // an app that polls it doesn't keep an abandoned session alive or call the identity provider. A
 // session whose access token has expired still counts as signed in while it has a refresh token
@@ -462,8 +467,9 @@ func (p *Policy) handleCheckSession(ctx context.Context, ds *policy.DownstreamRe
 }
 
 // signedIn is the ThunderID SDK backend-mode session payload for a live session: the user claims
-// of the id_token cached in Redis (the identity provider is not asked) and the access token's
-// expiry in unix seconds.
+// of the id_token cached in Redis (the identity provider is not asked), the access token's
+// expiry in unix seconds and its granted scopes, space-separated as in a token response. The
+// scopes let the app show only what the user can do; the token itself never leaves the gateway.
 func (p *Policy) signedIn(sess *session) policy.ImmediateResponse {
 	user := map[string]interface{}{}
 	if sess.IDToken == "" {
@@ -480,7 +486,8 @@ func (p *Policy) signedIn(sess *session) policy.ImmediateResponse {
 		IsSignedIn bool                   `json:"isSignedIn"`
 		User       map[string]interface{} `json:"user"`
 		ExpiresAt  int64                  `json:"expiresAt"`
-	}{true, user, sess.ExpiresAt})
+		Scope      string                 `json:"scope,omitempty"`
+	}{true, user, sess.ExpiresAt, strings.Join(sess.Scopes, " ")})
 	if err != nil {
 		slog.Error("OAuth2Session: encoding user claims failed", "error", err)
 		return unavailable()
@@ -535,7 +542,7 @@ func (p *Policy) handleRefresh(ctx context.Context, ds *policy.DownstreamRequest
 
 // handleUserinfo answers the session endpoint of the ThunderID SDK's backend mode:
 //
-//	{"isSignedIn": true, "user": {...}, "expiresAt": <access token expiry, unix seconds>}
+//	{"isSignedIn": true, "user": {...}, "expiresAt": <access token expiry, unix seconds>, "scope": "<granted scopes>"}
 //	{"isSignedIn": false}
 //
 // Both are 200, as the SDK expects; with {"isSignedIn": false} the session cookie the request

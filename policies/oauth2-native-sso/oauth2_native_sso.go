@@ -369,6 +369,11 @@ func (p *Policy) signIn(ctx context.Context, log *slog.Logger, sourceSID, scope 
 	if tok.DeviceSecret != "" {
 		deviceSecret = tok.DeviceSecret
 	}
+	// A response without scope granted exactly the requested scopes (RFC 8693 §2.2.1).
+	scopes := tok.Scopes
+	if len(scopes) == 0 {
+		scopes = p.cfg.scopes
+	}
 	sid, err := newRandomID()
 	if err != nil {
 		return "", err
@@ -378,7 +383,7 @@ func (p *Policy) signIn(ctx context.Context, log *slog.Logger, sourceSID, scope 
 		RefreshToken: tok.RefreshToken,
 		TokenType:    tok.TokenType,
 		IDToken:      tok.IDToken,
-		Scopes:       tok.Scopes,
+		Scopes:       scopes,
 		ExpiresAt:    tok.Expiry.Unix(),
 		CreatedAt:    createdAt,
 		ObtainedAt:   now.Unix(),
